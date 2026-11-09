@@ -14,6 +14,8 @@ import { eventsAround } from './gcal.js';
 import * as tp from './textproc.js';
 import { getUsage, getKaizen } from './usage.js';
 import { pcmBlobFromChunks, wavFromPcmBlob } from './wav.js';
+import { qrCanvas } from './qr.js';
+import { SETUP_PREFIX, setupPayload, encodeSetup, parseSetup } from './setuplink.js';
 import { toast, holdButton, confirmDialog, formDialog, renderMarkdown, chip, progressBar, section } from './ui.js';
 
 // ---------------------------------------------------------------------------
@@ -54,8 +56,14 @@ async function boot() {
   await loadSettings();
   await vocab.loadVocab();
   requestPersistence();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).catch(() => {});
 
+  // ほかの端末のQRコードから開かれた場合（設定は画面の中だけで扱い、URLからはすぐ消す）
+  let setupRaw = null;
+  if (location.hash.startsWith(SETUP_PREFIX)) {
+    setupRaw = location.hash.slice(SETUP_PREFIX.length);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
   if (location.hash === '#auth-return') {
     history.replaceState(null, '', location.pathname + location.search);
     try { const p = await completePendingAuth(); if (p) toast(p === 'ms' ? 'OneDriveにサインインしました' : 'Googleカレンダーを連携しました', 'ok'); } catch (e) { toast(errorMessage(e), 'error'); }
@@ -71,6 +79,14 @@ async function boot() {
 
   bindNav();
   render();
+  if (setupRaw) offerSetupImport(setupRaw);
+  // アプリを開いたまま、同じ画面でQRコードのリンクが開かれた場合（ページは読み込み直されない）
+  window.addEventListener('hashchange', () => {
+    if (!location.hash.startsWith(SETUP_PREFIX)) return;
+    const raw = location.hash.slice(SETUP_PREFIX.length);
+    history.replaceState(null, '', location.pathname + location.search);
+    offerSetupImport(raw);
+  });
   if (new URLSearchParams(location.search).get('action') === 'record') setTimeout(() => { const b = $('#btn-start'); if (b) b.focus(); }, 300);
 
   window.addEventListener('beforeunload', (e) => { if (S.rec || S.proc) { e.preventDefault(); e.returnValue = ''; } });
@@ -1043,6 +1059,95 @@ function detailMinutes(s) {
   return card;
 }
 
+/** OneDriveにサインインして、保存先フォルダを用意する（利用者の操作の直後に呼ぶこと） */
+async function signInOneDrive() {
+  let step = 'signin';
+  try {
+    await msLogin(getSettings().onedrive.clientId);
+    S.status.ms = true;
+    step = 'folder';
+    await od.ensureFolder(rootPath());
+    const me = await od.getMe().catch(() => ({}));
+    S.msAccount = me.userPrincipalName || me.mail || me.displayName || '';
+    toast(`OneDriveにサインインし、保存先フォルダ「${rootPath()}」を用意しました${S.msAccount ? `（${S.msAccount}）` : ''}`, 'ok', 8000);
+    afterMsReady();
+    render();
+    return true;
+  } catch (e) {
+    toast(step === 'folder' ? `サインインはできましたが、保存先フォルダ「${rootPath()}」を作れませんでした：${errorMessage(e)}` : errorMessage(e), 'error', 15000);
+    renderHeader();
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ほかの端末への設定の受け渡し（QRコード）。サーバーを通さず、画面からカメラへ直接渡す
+// ---------------------------------------------------------------------------
+function showSetupQr(includeKey) {
+  const st = getSettings();
+  if (!st.onedrive.clientId) { toast('先にこの端末で、OneDriveのアプリIDを設定してください。', 'warn'); return; }
+  if (includeKey && !st.gemini.apiKey) toast('この端末にはGeminiのAPIキーが保存されていないため、キーは渡しません。', 'warn', 6000);
+  let canvas;
+  try { canvas = qrCanvas(`${new URL('./', document.baseURI).href}${SETUP_PREFIX}${encodeSetup(setupPayload(getSettings(), includeKey))}`, { scale: 5 }); } catch (e) { toast(errorMessage(e), 'error'); return; }
+  canvas.className = 'qr';
+  const keyIncluded = includeKey && !!st.gemini.apiKey;
+  const dlg = el('dialog', { class: 'dialog' },
+    el('h3', {}, 'ほかの端末を設定する'),
+    el('ol', { class: 'small' },
+      el('li', {}, 'スマホのカメラ（またはGoogleレンズ）で、このQRコードを読み取ります。'),
+      el('li', {}, '表示されたリンクを開き、アプリの画面で「取り込む」を押します。'),
+      el('li', {}, '続けて「OneDriveにサインイン」を押します。これで完了です。')),
+    canvas,
+    keyIncluded ? el('p', { class: 'warn small' }, 'このQRコードにはGeminiのAPIキーが含まれます。読み取ったらすぐ閉じ、ほかの人に見せたり、写真に撮って残したりしないでください。') : null,
+    el('div', { class: 'row end' }, el('button', { class: 'btn primary', type: 'button', onclick: () => dlg.close() }, '閉じる')));
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.appendChild(dlg);
+  dlg.showModal();
+}
+
+/** 起動時に #setup= で開かれた場合：内容を確かめてもらってから取り込む */
+async function offerSetupImport(raw) {
+  const p = parseSetup(raw);
+  if (!p) { toast('設定のQRコードを読み取れませんでした。もう一度表示し直して読み取ってください。', 'error', 8000); return; }
+  const st = getSettings();
+  const tail = (v) => `…${String(v).slice(-4)}`;
+  const overwrite = (st.onedrive.clientId && st.onedrive.clientId !== p.od) || (p.g && st.gemini.apiKey && st.gemini.apiKey !== p.g);
+  const ok = await new Promise((resolve) => {
+    const dlg = el('dialog', { class: 'dialog' },
+      el('h3', {}, 'ほかの端末の設定を取り込みます'),
+      el('ul', { class: 'small' },
+        el('li', {}, `OneDrive：アプリID ${tail(p.od)}、保存先「${p.r || '会議録音アーカイブ'}」`),
+        el('li', {}, p.g ? `Gemini：APIキー ${tail(p.g)}${p.p ? '（課金を有効にしたキー）' : ''}` : 'Gemini：キーは含まれていません（この端末で貼り付けます）'),
+        el('li', {}, p.gc ? `Googleカレンダー：${p.ga || 'アカウント未指定'}` : 'Googleカレンダー：設定なし')),
+      el('p', { class: 'warn small' }, 'ご自身の端末に表示したQRコードを読み取った場合だけ「取り込む」を押してください。人から送られてきたリンクの場合は「やめる」を押してください（会議の内容の送り先を書き換えられるおそれがあります）。'),
+      overwrite ? el('p', { class: 'warn small strong' }, 'この端末の今の設定を上書きします。') : null,
+      el('div', { class: 'row end' },
+        el('button', { class: 'btn ghost', type: 'button', onclick: () => { dlg.close(); resolve(false); } }, 'やめる'),
+        el('button', { class: 'btn primary', type: 'button', onclick: () => { dlg.close(); resolve(true); } }, '取り込む')));
+    dlg.addEventListener('close', () => { dlg.remove(); resolve(false); });
+    document.body.appendChild(dlg);
+    dlg.showModal();
+  });
+  if (!ok) { toast('取り込みをやめました。', 'info'); return; }
+  const patch = { onedrive: { clientId: p.od, rootPath: p.r || '会議録音アーカイブ' } };
+  if (p.g) patch.gemini = { apiKey: p.g, paidConfirmed: !!p.p };
+  if (p.gc) patch.google = { clientId: p.gc, account: p.ga || '' };
+  await saveSettings(patch);
+  renderHeader();
+  render();
+  // サインインの画面は、利用者が押した直後でないと開けないため、ボタンを押してもらう
+  const dlg = el('dialog', { class: 'dialog' },
+    el('h3', {}, '取り込みました'),
+    el('p', { class: 'small' }, '最後に、この端末でOneDriveにサインインしてください。Microsoftの決まりで、サインインだけは端末ごとに1回必要です。'),
+    p.gc ? el('p', { class: 'muted small' }, 'Googleカレンダーは、この端末で②（議事録作成）を実行するときに、必要なら確認の画面が出ます。') : null,
+    el('div', { class: 'row end' },
+      el('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, 'あとで'),
+      el('button', { class: 'btn primary', type: 'button', onclick: async () => { dlg.close(); await signInOneDrive(); } }, 'OneDriveにサインイン')));
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.appendChild(dlg);
+  dlg.showModal();
+}
+
 /** 保存先フォルダの入力を、OneDriveの一番上からのパスにそろえる（「OneDrive/」や前後の「/」を取り除く） */
 function normalizeRoot(v) {
   const p = String(v || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').replace(/^OneDrive\/+/i, '').replace(/\/{2,}/g, '/');
@@ -1259,21 +1364,7 @@ function viewSettings() {
       el('button', { class: 'btn primary', type: 'button', onclick: async () => {
         await saveSettings({ onedrive: { clientId: odClient.value.trim(), rootPath: normalizeRoot(odRoot.value) } });
         odRoot.value = rootPath();
-        let step = 'signin';
-        try {
-          await msLogin(odClient.value.trim());
-          S.status.ms = true;
-          step = 'folder';
-          await od.ensureFolder(rootPath());
-          const me = await od.getMe().catch(() => ({}));
-          S.msAccount = me.userPrincipalName || me.mail || me.displayName || '';
-          toast(`OneDriveにサインインし、保存先フォルダ「${rootPath()}」を用意しました${S.msAccount ? `（${S.msAccount}）` : ''}`, 'ok', 8000);
-          afterMsReady();
-          render();
-        } catch (e) {
-          toast(step === 'folder' ? `サインインはできましたが、保存先フォルダ「${rootPath()}」を作れませんでした：${errorMessage(e)}` : errorMessage(e), 'error', 15000);
-          renderHeader();
-        }
+        await signInOneDrive();
       } }, S.status.ms ? '保存して再サインイン' : '保存してサインイン'),
       el('button', { class: 'btn', type: 'button', onclick: async () => { await saveSettings({ onedrive: { clientId: odClient.value.trim(), rootPath: normalizeRoot(odRoot.value) } }); odRoot.value = rootPath(); toast('保存しました（OneDriveのフォルダは、「保存してサインイン」に成功した時点で作られます）', 'ok', 6000); renderHeader(); } }, '保存のみ'),
       S.status.ms ? el('button', { class: 'btn ghost', type: 'button', onclick: async () => { await msLogout(); S.status.ms = false; watcher.stop(); render(); } }, 'サインアウト') : null),
@@ -1310,6 +1401,14 @@ function viewSettings() {
     el('div', { class: 'row' },
       el('button', { class: 'btn primary', type: 'button', onclick: async () => { await saveSettings({ google: { clientId: gClient.value.trim(), account: gAcc.value.trim(), autoCalendar: gAuto.checked }, privacy: { calendarSummary: gSum.checked } }); await pushShared(); if (gClient.value.trim()) { try { await googleLogin(gClient.value.trim(), gAcc.value.trim()); S.status.google = true; toast('Googleカレンダーを連携しました', 'ok'); } catch (e) { toast(errorMessage(e), 'error'); } } render(); } }, '保存して連携'),
       st.google.clientId ? el('button', { class: 'btn ghost', type: 'button', onclick: async () => { await googleLogout(); S.status.google = false; render(); } }, '連携を解除') : null)));
+
+  // ほかの端末（スマホなど）を設定する
+  const withKey = el('input', { type: 'checkbox', checked: true });
+  wrap.appendChild(section('ほかの端末（スマホなど）を設定する',
+    el('p', { class: 'small' }, 'この端末の設定（OneDrive・Gemini・Googleカレンダー）を、QRコードでほかの端末に渡します。ほかの端末では、カメラで読み取って「取り込む」を押し、OneDriveにサインインするだけで使えます。'),
+    el('label', { class: 'check' }, withKey, 'GeminiのAPIキーも渡す（外すと、ほかの端末でキーを貼り付けます）'),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn primary', type: 'button', onclick: () => showSetupQr(withKey.checked) }, 'QRコードを表示'))));
 
   // 録音・書き起こし・メモ
   const r = st.recording;
@@ -1357,7 +1456,7 @@ function viewSettings() {
       el('label', { class: 'btn' }, '設定を読み込む', el('input', { type: 'file', accept: 'application/json', class: 'hidden', onchange: importSettings })),
       el('button', { class: 'btn danger', type: 'button', onclick: wipeLocal }, '端末内のデータを消去'))));
 
-  wrap.appendChild(el('p', { class: 'muted small center' }, `端末ID：${st.deviceId}　／　AI会議録音＆OneDrive自動議事録 v2.1`));
+  wrap.appendChild(el('p', { class: 'muted small center' }, `端末ID：${st.deviceId}　／　AI会議録音＆OneDrive自動議事録 v2.2`));
   return wrap;
 }
 
