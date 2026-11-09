@@ -12,7 +12,7 @@ export const DEFAULT_SETTINGS = {
     textModel: 'gemini-3.8-flash', // 用語補正・単語抽出
     minutesModel: 'gemini-3.8-flash',
     language: 'ja-JP',
-    chunkMinutes: 20,              // 話者分離ありは1回30分までなので余裕を持たせる
+    chunkMinutes: 10,              // 区切りの長さ。話者分離は1回30分まで。スマホのメモリを考えて10分
   },
   onedrive: {
     clientId: '',
@@ -50,6 +50,7 @@ export const DEFAULT_SETTINGS = {
   budget: {
     monthlyUsd: 10,
   },
+  lastScene: 'room',             // 録音の場面（room：対面、speaker：PCのスピーカーの音、tab：PCのタブ音声）
   lastProjectId: 'common',
   lastTemplateId: 'standard',
 };

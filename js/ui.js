@@ -89,9 +89,11 @@ function inline(text, onTime) {
     if (t.type === 'time') {
       return onTime ? el('button', { class: 'time-tag', type: 'button', onclick: () => onTime(t.sec) }, t.text) : el('span', { class: 'time-tag' }, t.text);
     }
-    if (t.text.includes('⚠根拠未確認')) {
-      const [a, ...rest] = t.text.split('⚠根拠未確認');
-      return [a, el('span', { class: 'warn-tag', title: '書き起こしに対応する発言が見つかりませんでした' }, '⚠根拠未確認'), rest.join('⚠根拠未確認')];
+    for (const [mark, tip] of [['⚠根拠未確認', '根拠の時刻の前後に発言が見つかりませんでした'], ['△内容要確認', '根拠の時刻の発言と内容がほとんど一致しませんでした']]) {
+      if (t.text.includes(mark)) {
+        const [a, ...rest] = t.text.split(mark);
+        return [a, el('span', { class: 'warn-tag', title: tip }, mark), rest.join(mark)];
+      }
     }
     return t.text;
   });

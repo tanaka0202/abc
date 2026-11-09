@@ -1,5 +1,5 @@
 // オフラインでも画面を開けるようにする（アプリ本体のファイルだけを保存。会議データは保存しない）
-const CACHE = 'mtgrec-v2.0.0';
+const CACHE = 'mtgrec-v2.1.0';
 const FILES = [
   './', './index.html', './auth.html', './manifest.webmanifest', './css/app.css', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png',
   './js/app.js', './js/util.js', './js/db.js', './js/settings.js', './js/wav.js', './js/textproc.js', './js/audio-worklet.js',

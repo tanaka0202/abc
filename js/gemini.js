@@ -24,7 +24,7 @@ async function generate(model, body, { kind, sessionId, audioSec = 0, signal } =
       r = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': g.apiKey },
-        body: typeof body === 'string' ? body : JSON.stringify(body),
+        body: typeof body === 'string' || body instanceof Blob ? body : JSON.stringify(body),
         signal,
       });
     } catch (e) {
@@ -40,16 +40,20 @@ async function generate(model, body, { kind, sessionId, audioSec = 0, signal } =
         ? `Geminiの利用上限に達しました。クレジット・課金の設定を確認してください。（${msg}）`
         : `Geminiが一時的に応答しません（${r.status}）。`);
       lastErr.status = r.status;
-      if (r.status === 429 && /prepay|credit|billing|quota/i.test(msg) && attempt >= 1) break;
+      // 前払い残高が0ドルのとき、402ではなく 429「Your prepayment credits are depleted」で返る例がある
+      if (r.status === 429 && /prepay/i.test(msg)) throw prepayError();
+      if (r.status === 429 && /credit|billing|quota/i.test(msg) && attempt >= 1) break;
       await sleep(3000 * 2 ** attempt);
       continue;
     }
     const j = await r.json().catch(() => ({}));
+    if (r.status === 402) throw prepayError();
     if (!r.ok) {
       const msg = (j.error && j.error.message) || String(r.status);
       let user = `Geminiの処理に失敗しました（${msg}）`;
-      if (/API key not valid|API_KEY_INVALID/i.test(msg)) user = 'GeminiのAPIキーが正しくありません。';
-      else if (r.status === 403) user = `このAPIキーでは利用できません。キーの制限（このサイトのみ・Gemini APIのみ）や課金設定を確認してください。（${msg}）`;
+      if (/API key not valid|API_KEY_INVALID/i.test(msg)) user = 'GeminiのAPIキーが正しくありません。キーを最初から最後まで貼り付けたか確認してください。';
+      else if (r.status === 401) user = `GeminiのAPIキーが受け付けられませんでした。AI Studioの「API Keys」で作ったキー（AQ.で始まるもの）を、最初から最後まで貼り付けてください。直らなければ、キーを作り直してください。（${msg}）`;
+      else if (r.status === 403) user = `このAPIキーでは利用できません。キーの「APIの制限」に「Gemini API」が入っているか、課金と前払い残高を確認してください。（${msg}）`;
       const err = new AppError(user);
       err.status = r.status;
       err.apiMessage = msg;
@@ -63,7 +67,9 @@ async function generate(model, body, { kind, sessionId, audioSec = 0, signal } =
       thoughtTok: u.thoughtsTokenCount || 0,
     }).catch(() => {});
     if (j.promptFeedback && j.promptFeedback.blockReason) {
-      throw new AppError(`Geminiが処理を拒否しました（${j.promptFeedback.blockReason}）。`);
+      const err = new AppError(`Geminiが処理を拒否しました（${j.promptFeedback.blockReason}）。`);
+      err.code = 'blocked';
+      throw err;
     }
     const cand = (j.candidates || [])[0];
     if (!cand) throw new AppError('Geminiから結果が返りませんでした。');
@@ -81,16 +87,46 @@ async function generate(model, body, { kind, sessionId, audioSec = 0, signal } =
 const textOf = (cand) => ((cand.content && cand.content.parts) || [])
   .filter((p) => typeof p.text === 'string' && !p.thought).map((p) => p.text).join('');
 
-async function generateJson(model, { system, parts, schema }, opts) {
-  const body = {
+/**
+ * JSON形式で結果を受け取る。
+ * thinkingLevel：単純な作業（用語補正・抽出）は 'low' にして、推論の時間と費用を抑える。
+ * 推論量の指定に対応しないモデル（設定で変更した場合など）は、指定を外して再試行する。
+ */
+async function generateJson(model, { system, parts, schema, thinkingLevel }, opts) {
+  const build = (withThinking) => ({
     systemInstruction: system ? { parts: [{ text: system }] } : undefined,
     contents: [{ role: 'user', parts }],
-    generationConfig: { responseMimeType: 'application/json', responseSchema: schema },
-  };
-  const cand = await generate(model, body, opts);
-  const obj = parseJsonLoose(textOf(cand));
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: schema,
+      ...(withThinking && thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
+    },
+  });
+  let cand;
+  try {
+    cand = await generate(model, build(true), opts);
+  } catch (e) {
+    if (thinkingLevel && e.status === 400 && /thinking/i.test(e.apiMessage || '')) cand = await generate(model, build(false), opts);
+    else throw e;
+  }
+  const raw = textOf(cand);
+  if (!raw.trim()) {
+    const err = new AppError('Geminiから空の結果が返りました（一時的な不具合の可能性があります）。');
+    err.code = 'empty';
+    throw err;
+  }
+  const obj = parseJsonLoose(raw);
   if (!obj) throw new AppError('Geminiの結果を読み取れませんでした（形式の不一致）。再試行してください。');
   return obj;
+}
+
+/**
+ * 大きな音声の送信用本文を、JSON.stringify を通さずに組み立てる（スマホのメモリ対策）。
+ * base64 は JSON でエスケープが不要な文字だけなので、そのまま連結してよい。
+ * JSON.stringify は巨大な文字列を全体複製・走査するため、それを避ける。
+ */
+function audioBody(prefix, b64, suffix) {
+  return prefix + b64 + suffix;
 }
 
 /** APIキーの確認 */
@@ -143,17 +179,18 @@ export async function transcribeChunk(wavBlob, { chunkIndex, offsetSec, durSec, 
   const cfg = { languageCodes: [g.language || 'ja-JP'] };
   if (diarization) { cfg.diarization = true; cfg.wordTimestamp = true; }
   else if (vocab && vocab.length) cfg.customVocabulary = vocab.slice(0, 100); // 話者分離と同時には使えない仕様
-  const body = JSON.stringify({
-    contents: [{ role: 'user', parts: [{ inlineData: { mimeType: 'audio/wav', data } }] }],
-    generationConfig: { audioTranscriptionConfig: cfg },
-  });
+  const body = audioBody(
+    '{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"audio/wav","data":"',
+    data,
+    `"}}]}],"generationConfig":${JSON.stringify({ audioTranscriptionConfig: cfg })}}`,
+  );
   const cand = await generate(g.transcribeModel, body, { kind: 'transcribe', sessionId, audioSec: durSec, signal });
   const segs = parseTranscribeParts(cand, chunkIndex, offsetSec, durSec);
   if (!segs.length) {
     const t = textOf(cand).trim();
     if (t) return [{ label: `c${chunkIndex}:spk_1`, start: offsetSec, end: offsetSec + durSec, text: t, raw: t, estimated: true }];
   }
-  return segs;
+  return segs; // 空の場合は呼び出し側で再試行・代替する（「成功」で中身が空の不具合への対策）
 }
 
 /** 書き起こし専用モデルが使えない場合の代替（汎用モデルに音声を渡す） */
@@ -185,7 +222,11 @@ export async function transcribeChunkGeneral(wavBlob, { chunkIndex, offsetSec, d
     system,
     parts: [{ inlineData: { mimeType: 'audio/wav', data } }, { text: 'この音声を書き起こしてください。' }],
     schema,
-  }, { kind: 'transcribe-general', sessionId, audioSec: durSec, signal });
+    thinkingLevel: 'low',
+  }, { kind: 'transcribe-general', sessionId, audioSec: durSec, signal }).catch((e) => {
+    if (e.code === 'empty') return { segments: [] };
+    throw e;
+  });
   const segs = (obj.segments || []).map((s) => {
     const m = String(s.start || '').match(/(\d+):(\d{2})/);
     const st = m ? Number(m[1]) * 60 + Number(m[2]) : null;
@@ -242,7 +283,7 @@ export async function refineTranscript(segments, { terms, participants, speakerN
       '■書き起こし（id|話者ラベル|時刻|発言）：',
       lines,
     ].filter(Boolean).join('\n\n');
-    const obj = await generateJson(g.textModel, { system, parts: [{ text }], schema }, { kind: 'refine', sessionId, signal });
+    const obj = await generateJson(g.textModel, { system, parts: [{ text }], schema, thinkingLevel: 'low' }, { kind: 'refine', sessionId, signal });
     for (const s of obj.speakers || []) if (s && s.label && !mapping[s.label]) mapping[s.label] = { speaker: s.speaker, name: (s.name || '').trim() };
     corrections.push(...(obj.corrections || []));
   }
@@ -296,6 +337,14 @@ const MINUTES_SCHEMA = {
   },
   required: ['summary', 'decisions', 'todos', 'sections', 'openIssues'],
 };
+
+/** 前払い残高が0ドルのときの案内（Gemini APIの課金ページ 2026-09-28更新 に基づく） */
+function prepayError() {
+  const err = new AppError('Gemini APIの前払い残高が0ドルになったため、処理が止まっています。Google AI Studioの「Billing」で残高を追加してください（最低5ドル。前払い分は購入から12か月で失効します。Google AI Proのクレジットは、前払い残高が0ドルより多いときだけ使われます）。');
+  err.status = 402;
+  err.code = 'prepay';
+  return err;
+}
 
 export async function generateMinutes(ctx) {
   const g = requireReady();
@@ -363,7 +412,7 @@ export async function extractTermsFromMaterials(materials, existing, { sessionId
     if (m.text) parts.push({ text: `■資料「${m.name}」：\n${m.text.slice(0, 60000)}` });
     else if (m.data) { parts.push({ text: `■資料「${m.name}」` }); parts.push({ inlineData: { mimeType: m.mimeType, data: m.data } }); }
   }
-  return generateJson(g.textModel, { system, parts, schema: TERMS_SCHEMA }, { kind: 'terms-materials', sessionId });
+  return generateJson(g.textModel, { system, parts, schema: TERMS_SCHEMA, thinkingLevel: 'low' }, { kind: 'terms-materials', sessionId });
 }
 
 /** 利用者の手直し（直す前と後）から、用語の訂正と書き方のルールを学ぶ */
@@ -381,5 +430,5 @@ export async function learnFromEdits(pairs, existing, { sessionId, kind = 'trans
     '■手直しの内容：',
     ...pairs.slice(0, 60).map((p, i) => `(${i + 1}) 前：${p.before}\n    後：${p.after}`),
   ].join('\n');
-  return generateJson(g.textModel, { system, parts: [{ text }], schema: TERMS_SCHEMA }, { kind: `learn-${kind}`, sessionId });
+  return generateJson(g.textModel, { system, parts: [{ text }], schema: TERMS_SCHEMA, thinkingLevel: 'low' }, { kind: `learn-${kind}`, sessionId });
 }

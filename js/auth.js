@@ -51,7 +51,11 @@ function openPopup() {
   }
 }
 
-function waitForResult(state, timeoutMs = 5 * 60 * 1000) {
+/**
+ * サインインの結果を待つ。watch に開いた窓を渡すと、結果が届かないまま窓が閉じられたときに、
+ * 5分待たせずに知らせる（サインイン画面にエラーが出て、利用者が閉じた場合など）。
+ */
+function waitForResult(state, timeoutMs = 5 * 60 * 1000, watch = null) {
   return new Promise((resolve, reject) => {
     let done = false;
     let bc = null;
@@ -67,8 +71,21 @@ function waitForResult(state, timeoutMs = 5 * 60 * 1000) {
       if (e.key === RESULT_KEY && e.newValue) { try { finish(JSON.parse(e.newValue).data); } catch { /* 無視 */ } }
     };
     const timer = setTimeout(() => { if (!done) { done = true; cleanup(); reject(new AppError('サインインがタイムアウトしました。もう一度お試しください。')); } }, timeoutMs);
+    let closedAt = 0;
     const poll = setInterval(() => {
       try { const raw = localStorage.getItem(RESULT_KEY); if (raw) finish(JSON.parse(raw).data); } catch { /* 無視 */ }
+      let closed = false;
+      try { closed = !!(watch && watch.closed); } catch { closed = false; }
+      if (!closed || done) return;
+      if (!closedAt) { closedAt = Date.now(); return; }
+      // 戻り先ページは結果を渡してから自分で閉じるので、閉じてから少し待って結果がなければ失敗とする
+      if (Date.now() - closedAt > 2000) {
+        done = true;
+        cleanup();
+        const err = new AppError('サインインが完了しませんでした（サインイン画面が閉じられました）。画面に英語のエラーが出ていた場合は、手順書7章「サインインのエラー」で原因を確認してください。多くは、戻り先URLがMicrosoft Entraの登録と一致していないことが原因です。');
+        err.code = 'popup_closed';
+        reject(err);
+      }
     }, 700);
     function cleanup() {
       clearTimeout(timer);
@@ -83,7 +100,7 @@ function waitForResult(state, timeoutMs = 5 * 60 * 1000) {
   });
 }
 
-async function runFlow(popup, url, state, pending) {
+async function runFlow(popup, url, state, pending, { watchClosed = false } = {}) {
   if (!popup) {
     // ポップアップが使えない場合は、画面ごと移動して戻ってくる
     localStorage.setItem(PENDING_KEY, JSON.stringify({ ...pending, state, at: Date.now() }));
@@ -91,7 +108,7 @@ async function runFlow(popup, url, state, pending) {
     return new Promise(() => {}); // 戻ってくるまで待つ（画面が切り替わる）
   }
   popup.location.href = url;
-  return waitForResult(state);
+  return waitForResult(state, undefined, watchClosed ? popup : null);
 }
 
 // ---------------------------------------------------------------- Microsoft
@@ -112,7 +129,8 @@ export async function msLogin(clientId) {
     state,
     prompt: 'select_account',
   })}`;
-  const data = await runFlow(popup, url, state, { provider: 'ms', verifier, clientId });
+  // Microsoftのサインイン画面は窓の開閉を確認できる（Googleの画面は、確認すると誤って「閉じた」と判定されることがあるため対象外）
+  const data = await runFlow(popup, url, state, { provider: 'ms', verifier, clientId }, { watchClosed: true });
   return msFinish(clientId, data, verifier);
 }
 
@@ -129,17 +147,18 @@ async function msFinish(clientId, data, verifier) {
   const r = await fetch(`${MS_AUTHORITY}/token`, { method: 'POST', body });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new AppError(`Microsoftのサインインに失敗しました：${j.error_description || j.error || r.status}`);
-  await saveMsTokens(j);
+  await saveMsTokens(j, true);
   return true;
 }
 
-async function saveMsTokens(j) {
+async function saveMsTokens(j, fresh = false) {
   const prev = (await kvGet('ms_tokens')) || {};
   await kvSet('ms_tokens', {
     accessToken: j.access_token,
     refreshToken: j.refresh_token || prev.refreshToken,
     expiresAt: Date.now() + (Number(j.expires_in) || 3600) * 1000,
     refreshedAt: Date.now(),
+    signedInAt: fresh ? Date.now() : (prev.signedInAt || Date.now()),
   });
 }
 
@@ -149,6 +168,9 @@ export async function msGetToken(clientId) {
   if (!t) throw new NeedLogin('ms');
   if (t.expiresAt - 60_000 > Date.now()) return t.accessToken;
   if (!t.refreshToken) throw new NeedLogin('ms');
+  // ブラウザ向けアプリの更新用トークンは、最初のサインインから約24時間で使えなくなる。
+  // 期限が近ければ通信せずにすぐ再サインインを求める（操作の直後に認証画面を開けるようにするため）
+  if (t.signedInAt && Date.now() - t.signedInAt > 23.5 * 3600_000) throw new NeedLogin('ms', 'OneDriveのサインインの有効期限（約24時間）が切れました。再サインインしてください。');
   if (!msRefreshing) {
     msRefreshing = (async () => {
       const body = new URLSearchParams({ client_id: clientId, grant_type: 'refresh_token', refresh_token: t.refreshToken, scope: MS_SCOPES });

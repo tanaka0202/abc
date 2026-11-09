@@ -158,3 +158,4 @@ th { background: var(--chip); }
 .dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 
 .auth-page { padding: 24px; text-align: center; }
+.redirect-box .row { flex-wrap: nowrap; } .redirect-box .input { flex: 1; min-width: 0; font-size: 0.85em; }

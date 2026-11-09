@@ -48,7 +48,8 @@ export class LivePublisher {
   async start() {
     await this.write('recording');
     this.hb = setInterval(() => this.write('recording'), 15000);
-    const poll = Math.max(3, Number(getSettings().sync.pollSec) || 5) * 1000;
+    // 停止指示の確認は8秒ごと（OneDriveへの問い合わせ回数を抑える）
+    const poll = Math.max(8, Number(getSettings().sync.pollSec) || 5) * 1000;
     this.ctl = setInterval(() => this.checkControl(), poll);
   }
 

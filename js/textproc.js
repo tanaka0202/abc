@@ -70,6 +70,80 @@ export function planChunks(durationSec, chunkSec = 1200, levels = [], searchSec 
   return chunks;
 }
 
+/**
+ * 重なり（のりしろ）つきの区切り。中心部分 [start, end) は重ならず、
+ * 実際に切り出す範囲 [sliceStart, sliceEnd) は前後に overlapSec ずつ広げる。
+ * 重なった部分の発言を比べて、区切りをまたいだ話者を機械的にそろえるため。
+ */
+export function planSlices(durationSec, chunkSec = 600, levels = [], overlapSec = 15) {
+  const chunks = planChunks(durationSec, chunkSec, levels);
+  return chunks.map((c, i) => ({
+    ...c,
+    sliceStart: i === 0 ? c.start : Math.max(0, c.start - overlapSec),
+    sliceEnd: i === chunks.length - 1 ? c.end : Math.min(durationSec, c.end + overlapSec),
+  }));
+}
+
+/** 重なった時間帯 [a, b] で、同じ時刻に話している話者どうしを対応づける（今の区切りのラベル → 前の区切りのラベル） */
+export function alignSpeakers(prevSegs, curSegs, a, b, minSec = 1) {
+  const score = new Map();
+  for (const p of prevSegs) {
+    if (p.estimated) continue;
+    for (const c of curSegs) {
+      if (c.estimated) continue;
+      const lo = Math.max(p.start, c.start, a);
+      const hi = Math.min(p.end != null ? p.end : p.start, c.end != null ? c.end : c.start, b);
+      if (hi > lo) {
+        const k = `${c.label}\u0000${p.label}`;
+        score.set(k, (score.get(k) || 0) + (hi - lo));
+      }
+    }
+  }
+  const pairs = [...score.entries()].map(([k, v]) => { const [c, p] = k.split('\u0000'); return { c, p, v }; }).sort((x, y) => y.v - x.v);
+  const map = {};
+  const usedPrev = new Set();
+  for (const { c, p, v } of pairs) {
+    if (v < minSec || map[c] || usedPrev.has(p)) continue;
+    map[c] = p;
+    usedPrev.add(p);
+  }
+  return map;
+}
+
+/**
+ * 区切りごとの書き起こしをつなぐ。
+ * results[i] = { start, end, sliceStart, sliceEnd, segs }（segs の時刻は録音全体での秒）
+ * ・各区切りからは中心部分 [start, end) に始まる発言だけを残す（重なり部分の二重取りを防ぐ）
+ * ・重なり部分で対応づいた話者には、前の区切りと同じラベルを付ける
+ */
+export function stitchChunks(results) {
+  const globalOf = {};
+  const out = [];
+  let linked = 0;
+  results.forEach((r, i) => {
+    const map = i > 0 ? alignSpeakers(results[i - 1].segs, r.segs, r.sliceStart, results[i - 1].sliceEnd) : {};
+    for (const sg of r.segs) {
+      if (sg.label in globalOf) continue;
+      const prevLabel = map[sg.label];
+      if (prevLabel && globalOf[prevLabel]) { globalOf[sg.label] = globalOf[prevLabel]; linked++; } else globalOf[sg.label] = sg.label;
+    }
+    const last = i === results.length - 1;
+    for (const sg of r.segs) {
+      if (sg.start >= r.start - 1e-6 && (last || sg.start < r.end)) out.push({ ...sg, label: globalOf[sg.label] });
+    }
+  });
+  out.sort((x, y) => x.start - y.start);
+  return { segments: out, linked };
+}
+
+/** 区切りの範囲が、ほぼ無音か（無音なら書き起こしが空でも正常とみなす） */
+export function isSilent(levels, a, b, thresholdDb = -50) {
+  const xs = (levels || []).slice(Math.floor(a), Math.ceil(b)).filter(Number.isFinite);
+  if (!xs.length) return false;
+  const sorted = xs.slice().sort((x, y) => x - y);
+  return sorted[Math.floor(sorted.length * 0.9)] < thresholdDb; // 9割以上の時間が小さな音
+}
+
 /** 区切りごとの話者ラベル（c0:spk_1 など）に、全体を通した表示名を割り当てる */
 export function assignSpeakers(segments, mapping = {}) {
   const order = [];
@@ -219,7 +293,7 @@ function evid(item) {
   const tags = (item.evidence || []).map((e) => parseTimeTag(String(e))).filter((x) => x != null);
   const uniq = [...new Set(tags)].sort((a, b) => a - b).slice(0, 4);
   const s = uniq.map((t) => `[${fmtTime(t)}]`).join('');
-  const warn = item.unverified ? ' ⚠根拠未確認' : '';
+  const warn = item.unverified ? ' ⚠根拠未確認' : item.weak ? ' △内容要確認' : '';
   const src = item.source === 'memo' ? '（メモより）' : item.source === 'material' ? '（資料より）' : '';
   return `${src}${s ? ' ' + s : ''}${warn}`;
 }
@@ -276,26 +350,49 @@ export function minutesToMarkdown(min, meta = {}) {
     meta.materials.forEach((n) => L.push(`- ${n}`));
     L.push('');
   }
-  L.push('---', '', '※この議事録はAIが録音・メモ・資料から作成しました。[MM:SS] は録音内の根拠の位置です。「⚠根拠未確認」の項目は、書き起こしに対応する発言が見つからなかったものです。');
+  L.push('---', '', '※この議事録はAIが録音・メモ・資料から作成しました。[MM:SS] は録音内の根拠の位置です。「⚠根拠未確認」は根拠の時刻の前後に発言が見つからなかった項目、「△内容要確認」は時刻は合うものの発言の内容とほとんど一致しなかった項目です。');
   return L.join('\n') + '\n';
 }
 
-/** 根拠の時刻を書き起こしと照合する（D-14）。各項目に unverified を付けて返す */
+const bigrams = (t) => {
+  const s = String(t || '').replace(/[\s、。・「」『』（）()［］[\]【】:：,，.．!！?？\-ー〜~／/]/g, '');
+  const set = new Set();
+  for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2));
+  return set;
+};
+
+/**
+ * 根拠の照合（D-14）。
+ * unverified：根拠の時刻の前後 tolSec 秒に発言がない（⚠根拠未確認）
+ * weak：時刻は合うが、前後60秒の発言と内容（2文字の組）がほとんど一致しない（△内容要確認）
+ */
 export function verifyEvidence(min, segments, tolSec = 15) {
   const has = (t) => segments.some((s) => {
     const a = (s.start || 0) - tolSec;
     const b = (s.end != null ? s.end : (s.start || 0)) + tolSec;
     return t >= a && t <= b;
   });
+  const contentOk = (text, times) => {
+    const ib = bigrams(text);
+    if (ib.size < 6) return true; // 短すぎる項目は判定しない
+    const near = segments.filter((s) => times.some((t) => (s.start || 0) >= t - 60 && (s.start || 0) <= t + 60));
+    const sb = bigrams(near.map((s) => s.text).join(''));
+    let hit = 0;
+    for (const g of ib) if (sb.has(g)) hit++;
+    return hit / ib.size >= 0.1;
+  };
   let flagged = 0;
+  let weakCount = 0;
   const mark = (it) => {
     if (!it || typeof it !== 'object') return it;
     const times = (it.evidence || []).map((e) => parseTimeTag(String(e))).filter((x) => x != null);
     const fromOther = it.source === 'memo' || it.source === 'material';
     const ok = times.some(has);
     const unverified = !fromOther && !ok;
+    const weak = !fromOther && ok && !contentOk(it.text || it.task || '', times.filter(has));
     if (unverified) flagged++;
-    return { ...it, unverified };
+    if (weak) weakCount++;
+    return { ...it, unverified, weak };
   };
   const out = {
     ...min,
@@ -305,7 +402,7 @@ export function verifyEvidence(min, segments, tolSec = 15) {
     sections: (min.sections || []).map((s) => ({ ...s, items: (s.items || []).map(mark) })),
     carryover: (min.carryover || []).map((c) => ({ ...c })),
   };
-  return { minutes: out, flagged };
+  return { minutes: out, flagged, weak: weakCount };
 }
 
 export function todosToCsv(todos, meta = {}) {

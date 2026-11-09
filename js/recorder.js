@@ -32,11 +32,15 @@ export class Recorder {
     this.onVisibility = this.onVisibility.bind(this);
   }
 
-  async start(source = 'mic') {
+  /**
+   * source：'mic'（マイク）または 'tab'（PCのタブ音声＋マイク）
+   * audioOverrides：場面に応じたマイクの音声処理の指定（設定より優先）
+   */
+  async start(source = 'mic', audioOverrides = {}) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new AppError('このブラウザでは録音できません（HTTPSで開いているか確認してください）');
     }
-    const rs = this.settings.recording;
+    const rs = { ...this.settings.recording, ...audioOverrides };
     // 画面共有の許可は操作の直後でないと求められないため、タブ音声を先に取得する
     if (source === 'tab') {
       try {

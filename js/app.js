@@ -78,7 +78,7 @@ async function boot() {
 
   if (S.status.ms) afterMsReady();
   pipe.cleanupLocal().catch(() => {});
-  setInterval(refreshRemoteMemos, 10000);
+  setInterval(refreshRemoteMemos, 15000);
   setInterval(pollRemoteMeta, 10000);
   setInterval(tickRemote, 1000);
 }
@@ -337,9 +337,13 @@ function renderRec() {
   const people = el('input', { class: 'input', id: 'in-people', placeholder: '参加者（読点「、」区切り。話者名の推定に使います）', value: S.setupPeople || '', oninput: (e) => { S.setupPeople = e.target.value; } });
   const conf = el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'in-conf', checked: !!S.setupConf, onchange: (e) => { S.setupConf = e.target.checked; } }), '機密の会議（カレンダーに要約を書かない）');
   const diar = el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'in-diar', checked: st.transcript.diarization !== false }), '話者を分けて書き起こす');
-  const source = isMobile() ? null : el('select', { class: 'input', id: 'in-source' },
-    el('option', { value: 'mic' }, 'マイクのみ'),
-    el('option', { value: 'tab' }, 'PCのタブ音声＋マイク（Web会議を直接録音）'));
+  const scenes = [
+    ['room', '対面の会議（マイクで直接録る）'],
+    ['speaker', 'PCのスピーカーから流れるWeb会議を録る'],
+    ...(isMobile() ? [] : [['tab', 'PCのタブ音声＋マイク（Web会議を直接録音）']]),
+  ];
+  const lastScene = scenes.some(([v]) => v === st.lastScene) ? st.lastScene : 'room';
+  const source = el('select', { class: 'input', id: 'in-scene' }, scenes.map(([v, label]) => el('option', { value: v, selected: v === lastScene }, label)));
   const fromCal = st.google.clientId ? el('button', { class: 'btn ghost small', type: 'button', onclick: pickFromCalendar }, '📅 予定から取り込む') : null;
   const startBtn = el('button', { class: 'btn rec-btn', id: 'btn-start', type: 'button', onclick: handleStart }, el('span', { class: 'dot' }), '録音開始');
   box.appendChild(el('section', { class: 'card rec-card' },
@@ -347,7 +351,8 @@ function renderRec() {
     el('div', { class: 'field' }, el('span', {}, '会議名'), el('div', { class: 'row nowrap' }, title, fromCal)),
     el('div', { class: 'row' }, el('label', { class: 'field grow' }, el('span', {}, '案件（単語帳）'), proj), el('label', { class: 'field grow' }, el('span', {}, '議事録の種類'), tpl)),
     el('label', { class: 'field' }, el('span', {}, '参加者'), people),
-    source ? el('label', { class: 'field' }, el('span', {}, '録音する音'), source) : null,
+    el('label', { class: 'field' }, el('span', {}, '録音の場面'), source,
+      el('small', { class: 'muted' }, '「PCのスピーカー」を選ぶと、離れたスピーカーの声を雑音と誤って消さないよう、雑音抑制を自動で切ります。')),
     el('div', { class: 'row' }, conf, diar),
     startBtn,
     setupHint()));
@@ -394,6 +399,9 @@ async function handleStart() {
     const projectId = ($('#in-project') || {}).value || 'common';
     const templateId = ($('#in-template') || {}).value || 'standard';
     const participants = String(S.setupPeople || '').split(/[、,，\s]+/).map((x) => x.trim()).filter(Boolean);
+    const scene = ($('#in-scene') || {}).value || 'room';
+    // 場面ごとのマイクの音声処理：PCのスピーカーの音は雑音抑制・エコー除去で消されやすいので切る
+    const audioOverrides = scene === 'speaker' ? { noiseSuppression: false, echoCancellation: false, autoGainControl: true } : {};
     const draft = S.draft;
     const session = {
       id: draft ? draft.id : uuid(),
@@ -401,7 +409,8 @@ async function handleStart() {
       projectId, templateId, participants,
       confidential: !!S.setupConf,
       diarization: ($('#in-diar') || { checked: true }).checked,
-      source: ($('#in-source') || {}).value || 'mic',
+      source: scene === 'tab' ? 'tab' : 'mic',
+      scene,
       status: 'recording', createdAt: Date.now(), steps: {},
       deviceId: st.deviceId, deviceName: st.deviceName, materials: [],
     };
@@ -422,13 +431,13 @@ async function handleStart() {
         if (msOk) startOnline(session);
       },
     });
-    await rec.start(session.source);
+    await rec.start(session.source, audioOverrides);
     S.rec = rec;
     S.session = session;
     S.remote = null; S.remoteMeta = null; S.otherMemos = [];
     kvSet('remoteTarget', null);
     S.myMemos = await memos.getMyMemos(session.id);
-    await saveSettings({ lastProjectId: projectId, lastTemplateId: templateId });
+    await saveSettings({ lastProjectId: projectId, lastTemplateId: templateId, lastScene: scene });
     S.setupTitle = ''; S.setupPeople = ''; S.setupConf = false; S.showLocalRec = false;
     render();
   } catch (e) {
@@ -517,10 +526,11 @@ async function runStep2UI(target) {
   if (S.proc) { toast('別の処理が実行中です', 'warn'); return; }
   const st = getSettings();
   try {
-    if (!(await ensureMs(true))) { toast('OneDriveの設定が必要です', 'warn'); return; }
+    // ボタンを押した直後でないと認証画面がブロックされるため、通信を伴うOneDriveの確認より先に行う
     if (st.google.clientId && st.google.autoCalendar && !(await googleTokenValid())) {
       try { await googleLogin(st.google.clientId, st.google.account); S.status.google = true; } catch { /* カレンダーなしで続行 */ }
     }
+    if (!(await ensureMs(true))) { toast('OneDriveの設定が必要です', 'warn'); return; }
   } catch (e) { toast(errorMessage(e), 'error'); return; }
   S.proc = { sessionId: target.id, kind: 'step2', progress: { text: '準備しています' } };
   renderProc();
@@ -1023,12 +1033,53 @@ function detailMinutes(s) {
   }
   card.append(
     el('div', { class: 'row between' },
-      el('span', { class: 'muted small' }, s.minutes.flagged ? `⚠根拠未確認の項目が${s.minutes.flagged}件あります。` : '[MM:SS]を押すと、根拠の発言を再生します。'),
+      el('span', { class: 'muted small' }, s.minutes.flagged || s.minutes.weak
+        ? `⚠根拠未確認 ${s.minutes.flagged || 0}件、△内容要確認 ${s.minutes.weak || 0}件。[MM:SS]を押して発言を確かめてください。`
+        : '[MM:SS]を押すと、根拠の発言を再生します。'),
       el('div', { class: 'row' },
         el('button', { class: 'btn small', type: 'button', onclick: () => copyText(s.minutes.markdown) }, 'コピー'),
         el('button', { class: 'btn small', type: 'button', onclick: () => { S.editMinutes = true; renderDetailBody(); } }, '手直しする'))),
     renderMarkdown(s.minutes.markdown, seek));
   return card;
+}
+
+/** 保存先フォルダの入力を、OneDriveの一番上からのパスにそろえる（「OneDrive/」や前後の「/」を取り除く） */
+function normalizeRoot(v) {
+  const p = String(v || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').replace(/^OneDrive\/+/i, '').replace(/\/{2,}/g, '/');
+  return p || '会議録音アーカイブ';
+}
+
+/** サインインの状態と保存先フォルダを表示し、OneDriveで直接開けるようにする */
+function renderOdStatus(box) {
+  box.replaceChildren();
+  if (!S.status.ms) {
+    box.appendChild(el('p', { class: 'muted small' }, '未サインイン：保存先フォルダはまだ作られていません。'));
+    return;
+  }
+  const line = el('p', { class: 'small' }, `サインイン中${S.msAccount ? `：${S.msAccount}` : ''}　保存先：OneDrive / ${rootPath()}`);
+  const open = el('button', { class: 'btn', type: 'button', onclick: async () => {
+    const w = window.open('', '_blank');
+    try {
+      const url = await od.webUrl(rootPath());
+      if (!url) { if (w) w.close(); toast(`OneDriveに「${rootPath()}」が見つかりません。「保存して再サインイン」を押すと作り直します。`, 'warn', 8000); return; }
+      if (w) w.location.href = url; else window.open(url, '_blank');
+    } catch (e) { if (w) w.close(); toast(errorMessage(e), 'error'); }
+  } }, '保存先をOneDriveで開く');
+  box.append(line, el('div', { class: 'row' }, open));
+}
+
+/** サインインの戻り先URL。各サービスの登録画面と1文字でも違うとサインインできないため、コピーして貼れるようにする */
+function redirectBox() {
+  const uri = redirectUri();
+  const box = el('div', { class: 'redirect-box' },
+    el('p', { class: 'muted small' }, 'このアプリのサインイン戻り先（Microsoft Entraの「認証」→「シングルページ アプリケーション」と、Googleの「承認済みのリダイレクトURI」に、このとおり登録します）'),
+    el('div', { class: 'row' },
+      el('input', { class: 'input mono', value: uri, readonly: true, onfocus: (e) => e.target.select() }),
+      el('button', { class: 'btn', type: 'button', onclick: () => copyText(uri) }, 'コピー')));
+  if (!/^https:\/\//.test(uri) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/)/.test(uri)) {
+    box.appendChild(el('p', { class: 'warn small' }, 'このページは公開先（https://…github.io/…）から開かれていません。この状態ではサインインできません。GitHub PagesのURLから開き直してください。'));
+  }
+  return box;
 }
 
 async function copyText(text) {
@@ -1039,6 +1090,10 @@ async function copyText(text) {
     try { document.execCommand('copy'); toast('コピーしました', 'ok', 1500); } catch { toast('コピーできませんでした', 'error'); }
     ta.remove();
   }
+}
+
+function fmtMB(bytes) {
+  return `${(Number(bytes || 0) / 1024 / 1024).toFixed(1)}MB`;
 }
 
 function detailMaterials(s) {
@@ -1060,7 +1115,11 @@ function detailMaterials(s) {
   (async () => {
     const local = await getFiles(s.id);
     const names = new Set(local.map((f) => f.name));
-    local.forEach((f) => box.appendChild(el('div', { class: 'list-item static' }, `📄 ${f.name}`, el('span', { class: 'muted small' }, f.uploaded ? 'OneDrive保存済み' : '未送信'))));
+    local.forEach((f) => box.appendChild(el('div', { class: 'list-item static' }, `📄 ${f.name}`, el('span', { class: 'muted small' }, `${fmtMB(f.size)}・${f.uploaded ? 'OneDrive保存済み' : '未送信'}`))));
+    const totalBytes = local.reduce((a, f) => a + (f.size || 0), 0);
+    if (totalBytes > 20 * 1024 * 1024) {
+      card.insertBefore(el('p', { class: 'warn small' }, `資料の合計が${fmtMB(totalBytes)}です。PDF・画像は合計40MBまでAIに渡し、超えた分は省きます。ページ数の多いPDFは議事録1回の費用が増えるため、必要なページだけにすると確実です。`), box);
+    }
     if (s.folderPath && S.status.ms) {
       const remote = await od.listChildren(od.joinPath(s.folderPath, '資料')).catch(() => []);
       remote.filter((r) => !names.has(r.name)).forEach((r) => box.appendChild(el('div', { class: 'list-item static' }, `📄 ${r.name}`, el('span', { class: 'muted small' }, 'OneDrive'))));
@@ -1186,30 +1245,52 @@ function viewSettings() {
       el('li', { class: ss.onedrive && S.status.ms ? 'done' : '' }, 'OneDrive：アプリIDを入力してサインイン'),
       el('li', { class: ss.gemini ? 'done' : '' }, 'Gemini：課金を有効にしたプロジェクトのAPIキーを入力し、確認欄にチェック'),
       el('li', { class: ss.google ? 'done' : '' }, 'Googleカレンダー：クライアントIDを入力（任意。未設定でも登録リンクで代替）')),
-    el('p', { class: 'muted small' }, `このアプリのサインイン戻り先（各サービスの登録画面に入力）：${redirectUri()}`),
+    redirectBox(),
     el('p', { class: 'muted small' }, '設定は端末ごとに保存されます。2台目の端末では、OneDriveにサインインすると単語帳と共通の設定が自動で取り込まれます（APIキーは各端末で入力）。')));
 
   // OneDrive
   const odClient = inp(st.onedrive.clientId, { placeholder: '00000000-0000-0000-0000-000000000000' });
   const odRoot = inp(st.onedrive.rootPath);
+  const odStatus = el('div', { class: 'od-status' });
   wrap.appendChild(section('OneDrive',
-    f('アプリID（クライアントID）', odClient, 'Microsoft Entra でこのアプリを登録したときのIDです（手順書2章）。'),
-    f('保存先フォルダ', odRoot, 'OneDriveの直下からのパス。中に「年月日_時分」のフォルダを作ります。'),
+    f('アプリID（クライアントID）', odClient, 'Microsoft Entra でこのアプリを登録したときの「アプリケーション（クライアント）ID」です（手順書2章）。'),
+    f('保存先フォルダ', odRoot, 'OneDriveの一番上（「自分のファイル」）からのパス。サインインに成功した時点で作られ、中に「年月日_時分」のフォルダを作ります。'),
     el('div', { class: 'row' },
-      el('button', { class: 'btn primary', type: 'button', onclick: async () => { await saveSettings({ onedrive: { clientId: odClient.value.trim(), rootPath: odRoot.value.trim() || '会議録音アーカイブ' } }); try { await msLogin(odClient.value.trim()); S.status.ms = true; await od.ensureFolder(rootPath()); const me = await od.getMe(); toast(`OneDriveにサインインしました（${me.userPrincipalName || me.displayName || ''}）`, 'ok'); afterMsReady(); render(); } catch (e) { toast(errorMessage(e), 'error'); } } }, S.status.ms ? '保存して再サインイン' : '保存してサインイン'),
-      el('button', { class: 'btn', type: 'button', onclick: async () => { await saveSettings({ onedrive: { clientId: odClient.value.trim(), rootPath: odRoot.value.trim() || '会議録音アーカイブ' } }); toast('保存しました', 'ok'); renderHeader(); } }, '保存のみ'),
-      S.status.ms ? el('button', { class: 'btn ghost', type: 'button', onclick: async () => { await msLogout(); S.status.ms = false; watcher.stop(); render(); } }, 'サインアウト') : null)));
+      el('button', { class: 'btn primary', type: 'button', onclick: async () => {
+        await saveSettings({ onedrive: { clientId: odClient.value.trim(), rootPath: normalizeRoot(odRoot.value) } });
+        odRoot.value = rootPath();
+        let step = 'signin';
+        try {
+          await msLogin(odClient.value.trim());
+          S.status.ms = true;
+          step = 'folder';
+          await od.ensureFolder(rootPath());
+          const me = await od.getMe().catch(() => ({}));
+          S.msAccount = me.userPrincipalName || me.mail || me.displayName || '';
+          toast(`OneDriveにサインインし、保存先フォルダ「${rootPath()}」を用意しました${S.msAccount ? `（${S.msAccount}）` : ''}`, 'ok', 8000);
+          afterMsReady();
+          render();
+        } catch (e) {
+          toast(step === 'folder' ? `サインインはできましたが、保存先フォルダ「${rootPath()}」を作れませんでした：${errorMessage(e)}` : errorMessage(e), 'error', 15000);
+          renderHeader();
+        }
+      } }, S.status.ms ? '保存して再サインイン' : '保存してサインイン'),
+      el('button', { class: 'btn', type: 'button', onclick: async () => { await saveSettings({ onedrive: { clientId: odClient.value.trim(), rootPath: normalizeRoot(odRoot.value) } }); odRoot.value = rootPath(); toast('保存しました（OneDriveのフォルダは、「保存してサインイン」に成功した時点で作られます）', 'ok', 6000); renderHeader(); } }, '保存のみ'),
+      S.status.ms ? el('button', { class: 'btn ghost', type: 'button', onclick: async () => { await msLogout(); S.status.ms = false; watcher.stop(); render(); } }, 'サインアウト') : null),
+    odStatus));
+  renderOdStatus(odStatus);
 
   // Gemini
-  const key = inp(st.gemini.apiKey, { type: 'password', autocomplete: 'off', placeholder: 'AIza…' });
+  const key = inp(st.gemini.apiKey, { type: 'password', autocomplete: 'off', placeholder: 'AQ.…（AI Studioで作ったキー）' });
   const paid = el('input', { type: 'checkbox', checked: st.gemini.paidConfirmed });
   const tModel = inp(st.gemini.transcribeModel);
   const xModel = inp(st.gemini.textModel);
   const mModel = inp(st.gemini.minutesModel);
   wrap.appendChild(section('Gemini（書き起こし・議事録）',
-    f('APIキー', key, 'この端末にだけ保存されます。Google Cloud側で「このサイトからのみ」「Gemini APIのみ」に制限してください（手順書3章）。'),
+    f('APIキー', key, 'この端末にだけ保存されます。AI Studioで作ったキーは、最初からGemini APIだけに制限されています。月の上限（Spend）を設定し、自動チャージはオフにしてください（手順書3章）。'),
     el('label', { class: 'check strong' }, paid, 'このキーは、課金（Cloud Billing）を有効にしたプロジェクトのものです'),
     el('p', { class: 'muted small' }, '無料枠では、送った内容がGoogleの製品改善に使われ、人が読むこともあります。課金を有効にしたプロジェクトでは学習に使われません。確認するまで、このアプリはGeminiに何も送りません。'),
+    el('p', { class: 'muted small' }, '確認のしかた：Google AI Studio の「Billing」画面で、このキーのプロジェクトが有料（Paid）になっていて、前払い残高が0ドルより多いこと。前払い残高は購入から12か月で失効し、0ドルになるとGoogle AI Proのクレジットも使えなくなります（手順書3章）。'),
     el('details', {}, el('summary', {}, 'モデルの設定（通常は変更不要）'),
       f('書き起こし（話者分離）', tModel), f('用語補正・単語の抽出', xModel), f('議事録', mModel)),
     el('div', { class: 'row' },
@@ -1276,7 +1357,7 @@ function viewSettings() {
       el('label', { class: 'btn' }, '設定を読み込む', el('input', { type: 'file', accept: 'application/json', class: 'hidden', onchange: importSettings })),
       el('button', { class: 'btn danger', type: 'button', onclick: wipeLocal }, '端末内のデータを消去'))));
 
-  wrap.appendChild(el('p', { class: 'muted small center' }, `端末ID：${st.deviceId}　／　AI会議録音＆OneDrive自動議事録 v2.0`));
+  wrap.appendChild(el('p', { class: 'muted small center' }, `端末ID：${st.deviceId}　／　AI会議録音＆OneDrive自動議事録 v2.1`));
   return wrap;
 }
 

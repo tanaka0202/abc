@@ -125,39 +125,75 @@ export async function runStep1(session, { onProgress, signal } = {}) {
   }
 }
 
+const OVERLAP_SEC = 15;
+
+/** 書き起こし専用モデルが使えない（未提供・仕様変更）と判断できるエラーか */
+const modelUnavailable = (e) => e && e.status >= 400 && e.status < 500 && ![401, 402, 403, 429].includes(e.status);
+/** 再試行・代替で回復しうる一時的な失敗か（中身が空・理由不明の拒否） */
+const transient = (e) => e && (e.code === 'empty' || e.code === 'blocked');
+
+/**
+ * 1区切りを書き起こす。
+ * Googleの書き起こしモデルは、まれに「成功」の応答で中身が空になる不具合が報告されているため、
+ * 空なら再試行し、それでも空なら汎用モデルで代替する。ほぼ無音の区切りは空でも正常とみなす。
+ */
+async function transcribeSlice(wav, opts, { silent, state, session }) {
+  if (!state.useGeneral) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const segs = await ai.transcribeChunk(wav, opts);
+        if (segs.length || silent) return segs;
+      } catch (e) {
+        if (modelUnavailable(e)) {
+          state.useGeneral = true;
+          await logKaizen('fallback', `書き起こし専用モデルが使えなかったため汎用モデルで代替（${e.apiMessage || e.message}）`);
+          break;
+        }
+        if (!transient(e)) throw e;
+      }
+      state.emptyRetries++;
+    }
+    if (!state.useGeneral) await logKaizen('fallback', `「${session.title}」の書き起こし（区切り${opts.chunkIndex + 1}）が空で返ったため、汎用モデルで代替しました`);
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const segs = await ai.transcribeChunkGeneral(wav, opts);
+      if (segs.length || silent) return segs;
+    } catch (e) {
+      if (!transient(e)) throw e;
+    }
+    state.emptyRetries++;
+  }
+  if (silent) return [];
+  throw new AppError('書き起こしの結果が空で返りました（GoogleのAPIの一時的な不具合の可能性があります）。しばらくしてから「① を再試行」を押してください。録音データは保存済みです。');
+}
+
 async function transcribe(session, pcm, { onProgress, signal }) {
   const st = getSettings();
   const duration = pcm.size / 2 / SAMPLE_RATE;
-  const plan = tp.planChunks(duration, Math.min(25, Number(st.gemini.chunkMinutes) || 20) * 60, session.levels || []);
+  // 区切りは最長10分（スマホのメモリ対策）。前後15秒を重ねて切り出し、話者をそろえる
+  const chunkSec = Math.max(1, Math.min(25, Number(st.gemini.chunkMinutes) || 10)) * 60;
+  const plan = tp.planSlices(duration, chunkSec, session.levels || [], OVERLAP_SEC);
   const terms = vocab.termsFor(session.projectId);
   const diarization = session.diarization !== false && st.transcript.diarization !== false;
-  let useGeneral = false;
-  let segs = [];
+  const state = { useGeneral: false, emptyRetries: 0 };
+  const results = [];
   for (let i = 0; i < plan.length; i++) {
     const c = plan[i];
     await progress(session, onProgress, 'transcribe', `書き起こしています（${i + 1}/${plan.length}）`, i / plan.length);
-    const wav = wavSlice(pcm, c.start, c.end);
+    const wav = wavSlice(pcm, c.sliceStart, c.sliceEnd);
     const opts = {
-      chunkIndex: i, offsetSec: c.start, durSec: c.end - c.start, diarization,
+      chunkIndex: i, offsetSec: c.sliceStart, durSec: c.sliceEnd - c.sliceStart, diarization,
       vocab: terms.map((t) => t.correct), participants: session.participants, sessionId: session.id, signal,
     };
-    let part;
-    if (!useGeneral) {
-      try {
-        part = await ai.transcribeChunk(wav, opts);
-      } catch (e) {
-        // 書き起こし専用モデルが使えない（未提供・仕様変更）場合は汎用モデルで代替
-        if (e.status && e.status >= 400 && e.status < 500 && e.status !== 401 && e.status !== 403 && e.status !== 429) {
-          useGeneral = true;
-          await logKaizen('fallback', `書き起こし専用モデルが使えなかったため汎用モデルで代替（${e.apiMessage || e.message}）`);
-        } else throw e;
-      }
-    }
-    if (useGeneral) part = await ai.transcribeChunkGeneral(wav, opts);
-    segs.push(...part);
+    const silent = tp.isSilent(session.levels, c.sliceStart, c.sliceEnd);
+    const segs = await transcribeSlice(wav, opts, { silent, state, session });
+    results.push({ ...c, segs });
   }
-  segs.sort((a, b) => a.start - b.start);
-  segs = tp.mergeSegments(segs.map((s, i) => ({ ...s, id: i })));
+  const stitched = tp.stitchChunks(results);
+  let segs = tp.mergeSegments(stitched.segments.map((x, i) => ({ ...x, id: i })));
+  session.speakerLinks = stitched.linked;
+  const useGeneral = state.useGeneral;
 
   // 用語の補正と話者のそろえ（失敗しても書き起こし自体は残す）
   await progress(session, onProgress, 'refine', '単語帳を使って用語を補正しています', 0.9);
@@ -180,7 +216,11 @@ async function transcribe(session, pcm, { onProgress, signal }) {
   segs = tp.assignSpeakers(segs, mapping);
   if (st.transcript.fillerLevel === 'standard') segs = segs.map((s) => ({ ...s, text: tp.removeFillers(s.text) }));
 
-  session.transcript = { segments: segs, mapping, corrections: applied, createdAt: Date.now(), model: useGeneral ? st.gemini.textModel : st.gemini.transcribeModel };
+  session.transcript = {
+    segments: segs, mapping, corrections: applied, createdAt: Date.now(),
+    model: useGeneral ? st.gemini.textModel : st.gemini.transcribeModel,
+    chunks: plan.length, speakerLinks: stitched.linked, emptyRetries: state.emptyRetries,
+  };
   await putSession(session);
   await saveTranscriptFiles(session);
 }
@@ -254,7 +294,7 @@ export async function runStep2(session, { onProgress, signal } = {}) {
     const tpl = tp.templateById(session.templateId);
 
     await progress(session, onProgress, 'minutes', '議事録を作成しています（1〜2分かかります）', 0.3);
-    const raw = await ai.generateMinutes({
+    const minutesArgs = {
       sessionId: session.id, title: session.title, templateId: session.templateId,
       when: `${fmtDateTime(session.startedAt)}〜（約${Math.max(1, Math.round((session.durationSec || 0) / 60))}分）`,
       participants: session.participants, projectName: project && project.id !== vocab.COMMON_ID ? project.name : '',
@@ -262,8 +302,16 @@ export async function runStep2(session, { onProgress, signal } = {}) {
       carryover: carry, memos: memoLines,
       transcriptText: segs.map((s) => `[${fmtTime(s.start)}] ${s.speaker}: ${s.text}`).join('\n'),
       materials, signal,
-    });
-    const { minutes, flagged } = tp.verifyEvidence(raw, segs);
+    };
+    let raw;
+    try {
+      raw = await ai.generateMinutes(minutesArgs);
+    } catch (e) {
+      if (e.code !== 'empty' && e.code !== 'blocked') throw e;
+      await progress(session, onProgress, 'minutes', '結果が空だったため、もう一度作成しています', 0.5);
+      raw = await ai.generateMinutes(minutesArgs);
+    }
+    const { minutes, flagged, weak } = tp.verifyEvidence(raw, segs);
     const meta = {
       title: session.title, startedAt: session.startedAt, endedAt: session.endedAt, durationSec: session.durationSec,
       participants: session.participants && session.participants.length ? session.participants : null,
@@ -271,7 +319,7 @@ export async function runStep2(session, { onProgress, signal } = {}) {
       folderUrl: session.folderWebUrl, materials: materials.map((m) => m.name),
     };
     const markdown = tp.minutesToMarkdown(minutes, meta);
-    session.minutes = { data: minutes, markdown, flagged, createdAt: Date.now(), edited: false };
+    session.minutes = { data: minutes, markdown, flagged, weak, createdAt: Date.now(), edited: false };
     session.memosMerged = memos;
     await putSession(session);
 
