@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- 通信先を Google（Gemini・カレンダー）と Microsoft（OneDrive）に限定する -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: https://*.1drv.com https://*.onedrive.com https://*.sharepoint.com https://*.livefilestore.com https://*.microsoftpersonalcontent.com https://*.live.com; connect-src 'self' https://generativelanguage.googleapis.com https://www.googleapis.com https://graph.microsoft.com https://login.microsoftonline.com https://*.1drv.com https://*.onedrive.com https://*.sharepoint.com https://*.livefilestore.com https://*.microsoftpersonalcontent.com https://*.live.com; worker-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <meta name="theme-color" content="#0f172a">
+  <title>AI会議録音＆OneDrive自動議事録</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">●</span>
+      <span class="brand-name">会議録音・議事録</span>
+    </div>
+    <div id="status" class="status" aria-live="polite"></div>
+  </header>
+  <nav id="nav" class="nav" aria-label="画面の切り替え"></nav>
+  <main id="main" class="main"><p class="muted">読み込み中…</p></main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <noscript>このアプリを使うには JavaScript を有効にしてください。</noscript>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
