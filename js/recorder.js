@@ -6,6 +6,7 @@ import { AppError } from './util.js';
 const FLUSH_SAMPLES = SAMPLE_RATE * 5;      // 5秒ごとに保存
 const GAP_THRESHOLD = SAMPLE_RATE * 2;      // 2秒以上の欠落を途切れとみなす
 const GAP_SLACK = SAMPLE_RATE * 0.3;        // 処理の遅れの分は補わない
+const STALL_MS = 8000;                      // 8秒以上音声が届かなければ、止まったとみなす
 
 export class Recorder {
   constructor({ session, settings, onLevel, onTick, onWarning, onStarted }) {
@@ -29,6 +30,10 @@ export class Recorder {
     this.writeErrors = 0;
     this.lowWarned = false;
     this.running = false;
+    this.savedSamples = 0;
+    this.lastAudioAt = 0;
+    this.stallWarned = false;
+    this.source = 'mic';
     this.onVisibility = this.onVisibility.bind(this);
   }
 
@@ -41,6 +46,8 @@ export class Recorder {
       throw new AppError('このブラウザでは録音できません（HTTPSで開いているか確認してください）');
     }
     const rs = { ...this.settings.recording, ...audioOverrides };
+    this.rs = rs;
+    this.source = source;
     // 画面共有の許可は操作の直後でないと求められないため、タブ音声を先に取得する
     if (source === 'tab') {
       try {
@@ -57,14 +64,7 @@ export class Recorder {
 
     let mic;
     try {
-      mic = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: !!rs.echoCancellation,
-          noiseSuppression: !!rs.noiseSuppression,
-          autoGainControl: !!rs.autoGainControl,
-          channelCount: 1,
-        },
-      });
+      mic = await this.getMic();
     } catch (e) {
       for (const st of this.streams) st.getTracks().forEach((t) => t.stop()); // 取得済みの画面共有を止める
       this.streams = [];
@@ -78,21 +78,15 @@ export class Recorder {
     this.node = new AudioWorkletNode(this.ctx, 'pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
     this.node.port.onmessage = (e) => this.onAudio(e.data);
 
-    let entry = this.node;
+    this.entry = this.node;
     if (rs.highpass) {
       const hp = this.ctx.createBiquadFilter();
       hp.type = 'highpass';
       hp.frequency.value = 90; // 空調・机の振動などの低い雑音を除く
       hp.connect(this.node);
-      entry = hp;
+      this.entry = hp;
     }
-    for (const s of this.streams) {
-      if (!s.getAudioTracks().length) continue;
-      this.ctx.createMediaStreamSource(s).connect(entry);
-      s.getAudioTracks().forEach((t) => t.addEventListener('ended', () => {
-        if (this.running) this.onWarning('ended', '音声の入力が止まりました（マイクが他のアプリに使われた可能性があります）。');
-      }));
-    }
+    for (const s of this.streams) this.connectStream(s);
     // AudioWorklet を確実に動かすため、無音で出力につなぐ
     const mute = this.ctx.createGain();
     mute.gain.value = 0;
@@ -107,15 +101,68 @@ export class Recorder {
     if (this.ctx.state === 'suspended') await this.ctx.resume();
 
     this.running = true;
+    this.lastAudioAt = Date.now();
     this.timer = setInterval(() => this.tick(), 1000);
     document.addEventListener('visibilitychange', this.onVisibility);
     await this.acquireWakeLock();
   }
 
+  getMic() {
+    const rs = this.rs || this.settings.recording;
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: !!rs.echoCancellation,
+        noiseSuppression: !!rs.noiseSuppression,
+        autoGainControl: !!rs.autoGainControl,
+        channelCount: 1,
+      },
+    });
+  }
+
+  connectStream(s) {
+    if (!s.getAudioTracks().length) return;
+    const src = this.ctx.createMediaStreamSource(s);
+    src.connect(this.entry);
+    s.sources = (s.sources || []).concat(src);
+    s.getAudioTracks().forEach((t) => t.addEventListener('ended', () => {
+      if (this.running && this.streams.includes(s)) this.onWarning('ended', '音声の入力が止まりました（マイクがほかのアプリに使われた可能性があります）。');
+    }));
+  }
+
+  /**
+   * 止まったマイクをつなぎ直して、同じ録音を続ける（途切れた時間は無音で補われる）。
+   * 画面共有（タブ音声）はつなぎ直せないため、マイクだけで続ける。
+   */
+  async restartInput() {
+    if (!this.running) return;
+    for (const s of this.streams) {
+      (s.sources || []).forEach((src) => { try { src.disconnect(); } catch { /* 無視 */ } });
+      s.getTracks().forEach((t) => t.stop());
+    }
+    this.streams = [];
+    let mic;
+    try {
+      mic = await this.getMic();
+    } catch (e) {
+      throw new AppError('マイクをつなぎ直せませんでした。ほかのアプリがマイクを使っていないか確認してください。', { cause: e });
+    }
+    this.streams.push(mic);
+    this.connectStream(mic);
+    if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
+    this.lastAudioAt = Date.now();
+    this.stallWarned = false;
+    if (this.source === 'tab') this.onWarning('noTabAudio', 'タブの音声はつなぎ直せないため、ここからはマイクの音だけを録音します。');
+  }
+
+  /** 端末内に保存し終わった長さ（秒） */
+  get savedSec() { return this.savedSamples / SAMPLE_RATE; }
+
   onAudio(float32) {
     if (!this.running || !float32 || !float32.length) return;
     const n = float32.length;
     const now = Date.now();
+    this.lastAudioAt = now;
+    this.stallWarned = false;
     if (this.t0 === null) {
       this.t0 = now - (n / SAMPLE_RATE) * 1000;
       this.onStarted(this.t0);
@@ -165,6 +212,7 @@ export class Recorder {
     const sessionId = this.session.id;
     this.writeChain = this.writeChain
       .then(() => addChunk(sessionId, seq, merged.buffer))
+      .then(() => { this.savedSamples += merged.length; })
       .catch((e) => {
         this.writeErrors++;
         console.error(e);
@@ -185,6 +233,11 @@ export class Recorder {
   tick() {
     const elapsed = this.totalSamples / SAMPLE_RATE;
     this.onTick(elapsed);
+    // 音声が届かなくなった（マイクの停止、ブラウザによる一時停止など）
+    if (this.running && !this.stallWarned && Date.now() - this.lastAudioAt > STALL_MS && document.visibilityState === 'visible') {
+      this.stallWarned = true;
+      this.onWarning('stalled', `${Math.round((Date.now() - this.lastAudioAt) / 1000)}秒以上、音声が届いていません。`);
+    }
     if (!this.lowWarned && this.levels.length >= 15) {
       const recent = this.levels.slice(-15).slice().sort((a, b) => a - b);
       const median = recent[Math.floor(recent.length / 2)];

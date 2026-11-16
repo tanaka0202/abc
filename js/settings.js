@@ -31,6 +31,7 @@ export const DEFAULT_SETTINGS = {
     echoCancellation: false,
     holdToStop: true,
     autoStep1: true,               // 録音終了後に自動で①を実行
+    blackout: true,                // スマホでは録音を始めたら画面を黒くする（2回タップで操作）
   },
   transcript: {
     fillerLevel: 'standard',       // 'none' | 'standard'

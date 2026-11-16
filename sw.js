@@ -1,10 +1,10 @@
 // オフラインでも画面を開けるようにする（アプリ本体のファイルだけを保存。会議データは保存しない）
-const CACHE = 'mtgrec-v2.2.0';
+const CACHE = 'mtgrec-v2.3.0';
 const FILES = [
   './', './index.html', './auth.html', './manifest.webmanifest', './css/app.css', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png',
   './js/app.js', './js/util.js', './js/db.js', './js/settings.js', './js/wav.js', './js/textproc.js', './js/audio-worklet.js',
   './js/recorder.js', './js/auth.js', './js/auth-callback.js', './js/onedrive.js', './js/gcal.js', './js/gemini.js',
-  './js/usage.js', './js/vocab.js', './js/sync.js', './js/memos.js', './js/pipeline.js', './js/ui.js', './js/qr.js', './js/setuplink.js',
+  './js/usage.js', './js/vocab.js', './js/sync.js', './js/memos.js', './js/pipeline.js', './js/ui.js', './js/qr.js', './js/setuplink.js', './js/blackout.js',
 ];
 
 self.addEventListener('install', (e) => {
