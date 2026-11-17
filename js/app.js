@@ -1,14 +1,14 @@
 // 画面全体の制御
-import { el, clear, $, fmtTime, fmtDateTime, uuid, errorMessage, isMobile, debounce, sleep } from './util.js';
+import { el, clear, $, fmtTime, fmtDateTime, uuid, errorMessage, isMobile, isTouchDevice, APP_VERSION, debounce, sleep } from './util.js';
 import { loadSettings, getSettings, saveSettings, setupStatus, sharedPart, applyShared } from './settings.js';
-import { putSession, getSession, requestPersistence, wipeAll, getChunks, getFiles, kvGet, kvSet } from './db.js';
+import { putSession, getSession, listSessions, requestPersistence, wipeAll, getChunks, getFiles, kvGet, kvSet } from './db.js';
 import { Recorder } from './recorder.js';
-import { msLogin, msGetToken, msSignedIn, msLogout, googleLogin, googleTokenValid, googleLogout, completePendingAuth, NeedLogin, redirectUri } from './auth.js';
+import { msLogin, msGetToken, msSignedIn, msLogout, msSilent, msRenewal, googleLogin, googleTokenValid, googleLogout, googleSilent, googleRenewal, completePendingAuth, canBounce, frameKnownFail, reachable, silentRedirect, NeedLogin, redirectUri } from './auth.js';
 import * as od from './onedrive.js';
 import * as vocab from './vocab.js';
 import * as memos from './memos.js';
 import * as pipe from './pipeline.js';
-import { LivePublisher, LiveWatcher, requestRemoteStop, readAllMemos, rootPath, metaPath } from './sync.js';
+import { LivePublisher, LiveWatcher, StandbyAgent, requestRemoteStop, requestRemote, requestRemoteStart, readAllMemos, rootPath, metaPath } from './sync.js';
 import { testApiKey } from './gemini.js';
 import { eventsAround } from './gcal.js';
 import * as tp from './textproc.js';
@@ -33,7 +33,13 @@ const S = {
   memoT0: null,         // メモを書き始めた時刻
   myMemos: [],
   otherMemos: [],
-  proc: null,           // 処理中の状態 { sessionId, kind, progress }
+  proc: null,           // 処理中の状態 { sessionId, kind, phase, progress }
+  queue: [],            // 処理待ち [{ id, session, phase: 'all'|'save'|'transcribe' }]
+  unsaved: [],          // 録音は終えたが、まだ保存していない会議
+  pending: null,        // 直前に終えた、保存するかの確認待ちの会議
+  standbyAgent: null,   // この端末が待機中（ほかの端末からの録音開始を待つ）
+  remoteStandby: null,  // 待機中の、ほかの端末
+  awaiting: new Map(),  // 保存済みで、ほかの端末（PC）の書き起こしを待っている会議
   detail: null,         // 詳細表示中の会議
   detailTab: 'transcript',
   audioUrl: null,
@@ -48,12 +54,35 @@ const S = {
   status: { ms: false, google: false },
   level: -100,
 };
-const watcher = new LiveWatcher({ onChange: onRemoteChange, onError: () => {} });
+const watcher = new LiveWatcher({ onChange: onRemoteChange, onStandby: onRemoteStandby, onError: () => {} });
 
 // ---------------------------------------------------------------------------
 // 起動
 // ---------------------------------------------------------------------------
+/** アプリのファイルの版がそろっているか確かめる（更新の途中で、画面のデザインだけ古い版のまま、という状態を防ぐ） */
+async function checkVersion() {
+  const verEl = $('#app-ver');
+  if (verEl) verEl.textContent = `v${APP_VERSION.replace(/\.0$/, '')}`;
+  let cssVer = '';
+  try { cssVer = getComputedStyle(document.documentElement).getPropertyValue('--app-version').replace(/["'\s]/g, ''); } catch { /* 無視 */ }
+  let retried = false;
+  try { retried = sessionStorage.getItem('verRetry') === APP_VERSION; } catch { /* 無視 */ }
+  if (cssVer === APP_VERSION) { try { sessionStorage.removeItem('verRetry'); } catch { /* 無視 */ } return true; }
+  if (!retried) {
+    try { sessionStorage.setItem('verRetry', APP_VERSION); } catch { return false; }
+    try { const keys = await caches.keys(); await Promise.all(keys.map((k) => caches.delete(k))); } catch { /* 無視 */ }
+    const files = ['./', './css/app.css', './js/app.js', './js/blackout.js', './js/util.js', './js/ui.js', './js/recorder.js', './js/settings.js', './js/sync.js', './js/pipeline.js'];
+    await Promise.allSettled(files.map((f) => fetch(f, { cache: 'reload' })));
+    location.reload();
+    return false;
+  }
+  if (verEl) verEl.textContent += '（更新中）';
+  setTimeout(() => toast('アプリの更新が反映されている途中です（一部が古い版のままです）。数分待ってから、アプリを閉じて開き直してください。', 'warn', 12000), 500);
+  return true;
+}
+
 async function boot() {
+  if (!(await checkVersion())) return;
   await loadSettings();
   await vocab.loadVocab();
   requestPersistence();
@@ -67,8 +96,11 @@ async function boot() {
   }
   if (location.hash === '#auth-return') {
     history.replaceState(null, '', location.pathname + location.search);
-    try { const p = await completePendingAuth(); if (p) toast(p === 'ms' ? 'OneDriveにサインインしました' : 'Googleカレンダーを連携しました', 'ok'); } catch (e) { toast(errorMessage(e), 'error'); }
+    // 自動のつなぎ直し（silent）で戻ってきたときは、成功しても失敗しても何も表示しない
+    try { const p = await completePendingAuth(); if (p && !p.silent) toast(p.provider === 'ms' ? 'OneDriveにサインインしました' : 'Googleカレンダーを連携しました', 'ok'); } catch (e) { toast(errorMessage(e), 'error'); }
   }
+  // サインインが切れていて、見えない枠でのつなぎ直しが使えない端末：画面を出す前に、一瞬だけサービスへ移動して戻る
+  if (!setupRaw && (await bounceIfNeeded({ early: true }))) return;
   S.status.ms = await msSignedIn();
   S.status.google = await googleTokenValid();
   S.vocabProject = getSettings().lastProjectId || 'common';
@@ -90,14 +122,118 @@ async function boot() {
   });
   if (new URLSearchParams(location.search).get('action') === 'record') setTimeout(() => { const b = $('#btn-start'); if (b) b.focus(); }, 300);
 
-  window.addEventListener('beforeunload', (e) => { if (S.rec || S.proc) { e.preventDefault(); e.returnValue = ''; } });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshRemoteMemos(); });
+  window.addEventListener('beforeunload', (e) => { if (S.rec || S.proc || S.queue.length) { e.preventDefault(); e.returnValue = ''; } });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { refreshRemoteMemos(); keepConnections(); } });
+  // 利用者が操作を始めたら、画面ごとの移動（つなぎ直し）はしない
+  const touched = () => { S.touched = true; };
+  window.addEventListener('pointerdown', touched, { capture: true, once: true });
+  window.addEventListener('keydown', touched, { capture: true, once: true });
 
   if (S.status.ms) afterMsReady();
   pipe.cleanupLocal().catch(() => {});
   setInterval(refreshRemoteMemos, 15000);
   setInterval(pollRemoteMeta, 10000);
+  setInterval(pollAwaiting, 20000);
+  setInterval(scanWaiting, 30000);
+  refreshUnsaved();
   setInterval(tickRemote, 1000);
+  // サインインの自動更新：開いた直後と、開いている間は5分ごとに確かめる
+  keepConnections({ startup: true });
+  setInterval(() => keepConnections(), 5 * 60 * 1000);
+}
+
+// ---------------------------------------------------------------------------
+// サインインの自動更新（OneDriveは約24時間、Googleカレンダーは約1時間で切れるため、切れる前につなぎ直す）
+// ---------------------------------------------------------------------------
+/** いま、どちらのつなぎ直しが必要か。'no'｜'soon'（早めに更新したい）｜'expired'（切れている） */
+async function renewalNeeds() {
+  const st = getSettings();
+  return {
+    ms: st.onedrive.clientId ? await msRenewal() : 'no',
+    google: st.google.clientId ? await googleRenewal() : 'no',
+  };
+}
+
+/**
+ * 画面ごと一瞬だけサービスへ移動して、つなぎ直す（見えない枠でのつなぎ直しが使えない端末向け）。
+ * early＝画面を出す前（起動の直後）。移動するときは true を返す（その後、このページは切り替わる）。
+ * 録音中・処理中・操作を始めた後・オフラインのときは、移動しない。
+ */
+async function bounceIfNeeded({ early = false, only = null } = {}) {
+  const st = getSettings();
+  if (st.connection.autoRenew === false || location.search || navigator.onLine === false) return false;
+  if (S.rec || S.proc || S.queue.length || S.standbyAgent || S.pending || S.touched || document.visibilityState !== 'visible') return false;
+  const needs = await renewalNeeds();
+  for (const p of ['ms', 'google']) {
+    if (only && only !== p) continue;
+    if (needs[p] !== 'expired') continue;
+    if (early && !(await frameKnownFail(p))) continue; // まだ見えない枠を試していない端末は、先にそちらを試す
+    if (!(await canBounce(p)) || !(await reachable(p))) continue;
+    if (S.rec || S.proc || S.touched) return false;
+    await silentRedirect(p, p === 'ms' ? { clientId: st.onedrive.clientId } : { clientId: st.google.clientId, account: st.google.account });
+    return true;
+  }
+  return false;
+}
+
+/** 切れそう・切れているサインインを、画面を出さずにつなぎ直す。startup＝アプリを開いた直後 */
+async function keepConnections({ startup = false } = {}) {
+  const st = getSettings();
+  if (st.connection.autoRenew === false || navigator.onLine === false || S.keeping) return;
+  if (!startup && Date.now() - (S.keptAt || 0) < 60 * 1000) return;
+  S.keeping = true;
+  S.keptAt = Date.now();
+  let flush = startup;
+  try {
+    const needs = await renewalNeeds();
+    if (needs.ms !== 'no') {
+      const was = S.status.ms;
+      // 起動の直後は短めに待つ（つなぎ直せない端末で、画面ごとの移動に早く切り替えるため）
+      const ok = await msSilent(st.onedrive.clientId, { timeoutMs: startup ? 5000 : 8000 });
+      if (ok) {
+        S.status.ms = true;
+        renderHeader();
+        if (!was) afterMsReady();
+      } else if (needs.ms === 'expired' && startup && (await bounceIfNeeded({ only: 'ms' }))) return;
+    }
+    if (needs.google !== 'no') {
+      const ok = await googleSilent(st.google.clientId, st.google.account, { timeoutMs: startup ? 5000 : 8000 });
+      if (ok) { S.status.google = true; renderHeader(); flush = true; } else if (needs.google === 'expired') {
+        if (S.status.google) { S.status.google = false; renderHeader(); }
+        if (startup && (await bounceIfNeeded({ only: 'google' }))) return;
+      }
+    }
+    if (flush && (await googleTokenValid())) flushCalendarPending();
+  } catch { /* 次回 */ } finally { S.keeping = false; }
+}
+
+/** サインインが切れていて保留になっていたカレンダー登録を、つながったときにまとめて行う */
+async function flushCalendarPending() {
+  const st = getSettings();
+  if (!st.google.clientId || !st.google.autoCalendar || S.flushingCal) return;
+  S.flushingCal = true;
+  try {
+    for (const rec of await listSessions()) {
+      if (!rec.calendarPending || !rec.folderPath || Date.now() - (rec.startedAt || 0) > 14 * 86400000) continue;
+      if (S.proc && S.proc.sessionId === rec.id) continue;
+      const s = S.session && S.session.id === rec.id ? S.session : rec;
+      try {
+        if (await pipe.tryCalendar(s, s.minutes && s.minutes.data)) { await pipe.writeMeta(s); S.calFlushed = (S.calFlushed || 0) + 1; }
+      } catch { /* 次回 */ }
+    }
+  } finally { S.flushingCal = false; }
+}
+
+/** カレンダーを使える状態にする（利用者の操作の直後に呼ぶ）：切れていれば、まず画面を出さずにつなぎ直し、だめならサインイン画面を開く */
+async function googleInteractive() {
+  const g = getSettings().google;
+  if (await googleTokenValid()) return true;
+  // サインイン画面は、操作から数秒以内でないとブラウザに止められるため、つなぎ直しは2.5秒だけ待つ
+  const quick = await Promise.race([googleSilent(g.clientId, g.account, { timeoutMs: 2500 }), new Promise((r) => setTimeout(() => r(false), 2600))]);
+  if (!quick) await googleLogin(g.clientId, g.account);
+  S.status.google = true;
+  renderHeader();
+  return true;
 }
 
 async function afterMsReady() {
@@ -114,6 +250,13 @@ async function afterMsReady() {
     if (e instanceof NeedLogin) { S.status.ms = false; renderHeader(); }
   }
   if (S.view === 'list') loadList();
+  // 保存済みで書き起こしを待っている会議（この端末で保存したもの）の見張りを再開する
+  try {
+    for (const x of await listSessions()) {
+      if (x.status === 'saved' && x.folderPath && Date.now() - (x.audioSavedAt || 0) < 24 * 3600 * 1000) S.awaiting.set(x.id, x);
+    }
+  } catch { /* 無視 */ }
+  scanWaiting();
 }
 
 async function uploadVocab(v) {
@@ -126,12 +269,13 @@ async function ensureMs(interactive) {
   const st = getSettings();
   if (!st.onedrive.clientId) return false;
   try {
-    await msGetToken(st.onedrive.clientId);
+    await msGetToken(st.onedrive.clientId, { silent: !interactive });
     if (!S.status.ms) { S.status.ms = true; renderHeader(); }
     return true;
   } catch (e) {
     if (e instanceof NeedLogin && interactive) {
-      await msLogin(st.onedrive.clientId);
+      // 前回と同じアカウントで開く（ブラウザにサインイン状態が残っていれば、窓はすぐ閉じる）
+      await msLogin(st.onedrive.clientId, { quick: true });
       S.status.ms = true;
       renderHeader();
       afterMsReady();
@@ -171,6 +315,12 @@ function go(view) {
   if (view === 'list') loadList();
 }
 
+/** 部品をまとめて追加する（空の値は飛ばす。標準の append は null を「null」という文字として表示してしまうため） */
+function appendAll(node, ...children) {
+  node.append(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+  return node;
+}
+
 function render() {
   renderHeader();
   for (const b of document.querySelectorAll('.nav-btn')) b.classList.toggle('active', b.dataset.view === S.view || (S.view === 'detail' && b.dataset.view === 'list'));
@@ -193,6 +343,7 @@ function renderHeader() {
   box.appendChild(chip(ss.gemini ? 'Gemini ✓' : ss.geminiKeyOnly ? 'Gemini 課金確認待ち' : 'Gemini 未設定', ss.gemini ? 'ok' : 'warn'));
   if (ss.google) box.appendChild(chip(S.status.google ? 'カレンダー ✓' : 'カレンダー 要更新', S.status.google ? 'ok' : 'muted'));
   if (S.rec) box.appendChild(chip(`録音中 ${fmtTime(S.rec.elapsed)}`, 'rec'));
+  else if (S.standbyAgent) box.appendChild(chip('待機中', 'warn'));
   else if (S.remote && S.remote.status === 'recording') box.appendChild(chip(`${S.remote.deviceName}で録音中`, 'rec'));
 }
 
@@ -213,11 +364,12 @@ function viewMeeting() {
   const right = el('div', { class: 'col' });
   left.appendChild(el('div', { id: 'recover-box' }));
   left.appendChild(el('div', { id: 'remote-box' }));
+  left.appendChild(el('div', { id: 'unsaved-box' }));
   left.appendChild(el('div', { id: 'rec-box' }));
   left.appendChild(el('div', { id: 'proc-box' }));
   right.appendChild(el('div', { id: 'memo-box' }));
-  wrap.append(left, right);
-  queueMicrotask(() => { renderRecover(); renderRemote(); renderRec(); renderProc(); renderMemoBox(); });
+  appendAll(wrap, left, right);
+  queueMicrotask(() => { renderRecover(); renderRemote(); renderUnsaved(); renderRec(); renderProc(); renderMemoBox(); refreshUnsaved(); });
   return wrap;
 }
 
@@ -230,6 +382,7 @@ function renderRecover() {
       el('p', {}, `前回の録音「${s.title}」（${fmtTime(s.durationSec)}）が途中で終わっています。録音された部分は端末内に残っています。`),
       el('div', { class: 'row' },
         el('button', { class: 'btn primary', type: 'button', onclick: () => { S.recovered = S.recovered.filter((x) => x.id !== s.id); S.session = s; renderRecover(); runStep1UI(s); } }, '保存して書き起こす'),
+        el('button', { class: 'btn danger', type: 'button', onclick: async () => { await discardPending(s); S.recovered = (await Promise.all(S.recovered.map(async (x) => ((await getSession(x.id)) ? x : null)))).filter(Boolean); renderRecover(); } }, 'この録音を破棄'),
         el('button', { class: 'btn ghost', type: 'button', onclick: () => { S.recovered = S.recovered.filter((x) => x.id !== s.id); renderRecover(); } }, '後で（一覧から操作）'))));
   }
 }
@@ -237,6 +390,15 @@ function renderRecover() {
 // ---- 他の端末の録音（B-7） ----
 function onRemoteChange(live) {
   if (S.rec) return; // 自分が録音中は無視
+  if (live && live.status === 'discarded') {
+    // 録音した端末で、保存せずに破棄された
+    if (S.remote && S.remote.sessionId === live.sessionId) {
+      S.remote = null; S.remoteMeta = null; S.otherMemos = [];
+      kvSet('remoteTarget', null);
+      toast(`${live.deviceName}で、会議「${live.title}」の録音は破棄されました`, 'info', 6000);
+    }
+    live = null;
+  }
   if (live) {
     if (!S.remote || S.remote.sessionId !== live.sessionId) { S.otherMemos = []; S.remoteMeta = null; }
     S.remote = { ...live, savedAt: Date.now() };
@@ -264,6 +426,7 @@ async function pollRemoteMeta() {
       const was = S.remoteMeta && S.remoteMeta.status;
       S.remoteMeta = meta;
       if (meta.status === 'transcribed' && was !== 'transcribed') toast('書き起こしができました。「② 議事録作成」を押せます。', 'ok', 6000);
+      if (meta.status === 'saved' && was !== 'saved') scanWaiting(true);
       if (S.view === 'meeting') renderRemote();
     }
   } catch { /* 次回 */ }
@@ -286,24 +449,47 @@ function renderRemote() {
   const meta = S.remoteMeta;
   const card = el('section', { class: 'card remote' });
   if (r.status === 'recording') {
-    card.append(
+    appendAll(card, 
       el('div', { class: 'remote-head' }, el('span', { class: 'dot rec' }), el('strong', {}, `${r.deviceName}で録音中`), el('span', { id: 'remote-time', class: 'mono big' }, fmtTime((Date.now() - r.startedAt) / 1000))),
       el('p', {}, `会議：${r.title}`),
       el('p', { class: 'muted small' }, '右（スマホでは下）のメモ欄に書くと、録音の時刻と自動で結びつきます。'),
-      holdButton(`${r.deviceName}の録音を終了して①を実行`, () => remoteStop(r), { className: 'danger wide', enabled: getSettings().recording.holdToStop, hint: '長押しで終了' }));
+      holdButton(`${r.deviceName}の録音を終了`, () => remoteStop(r), { className: 'danger wide', enabled: getSettings().recording.holdToStop, hint: '長押しで終了' }),
+      el('p', { class: 'muted small' }, '終了しても、すぐには保存しません。終了後に「保存を始める」を押すと保存されます。'));
+  } else if (r.status === 'recorded' && !(meta && meta.steps && meta.steps.audio)) {
+    appendAll(card, 
+      el('div', { class: 'remote-head' }, el('span', { class: 'dot' }), el('strong', {}, `${r.deviceName}の録音を終了しました`)),
+      el('p', {}, `会議：${r.title}（まだ保存していません）`),
+      el('div', { class: 'row' },
+        el('button', { class: 'btn primary', type: 'button', id: 'btn-remote-save', onclick: () => remoteProcess(r) }, `保存を始める（${r.deviceName}で実行）`)),
+      el('p', { class: 'muted small' }, `${r.deviceName}でこのアプリが開いていて、画面がついている必要があります。不要な録音の破棄は、${r.deviceName}で行います。`));
   } else {
     const status = meta ? statusLabel(meta) : (r.status === 'lost' ? '録音端末からの連絡が途絶えています' : '録音終了・処理中');
-    card.append(
+    appendAll(card, 
       el('div', { class: 'remote-head' }, el('span', { class: 'dot' }), el('strong', {}, `会議「${r.title}」`)),
-      el('p', {}, status),
+      el('p', {}, `${status}${meta && meta.status === 'processing' && meta.processingName ? `（${meta.processingName}で処理中）` : ''}`),
       meta && meta.progress ? el('p', { class: 'muted small' }, meta.progress.text) : null,
+      meta && meta.status === 'saved' ? el('p', { class: 'muted small' }, transcribesHere() ? 'まもなく、この端末で自動的に書き起こします。' : '書き起こしは、PCでこのアプリを開くと自動で始まります。') : null,
       el('div', { class: 'row' },
+        meta && meta.status === 'saved' && !S.queue.some((q) => q.id === r.sessionId) ? el('button', { class: 'btn', type: 'button', id: 'btn-transcribe-remote', onclick: () => transcribeRemote(r.folderPath) }, 'この端末で書き起こす') : null,
         el('button', { class: 'btn primary', type: 'button', disabled: !(meta && meta.steps && meta.steps.transcript) || !!S.proc, onclick: () => runStep2UI({ id: r.sessionId, folderPath: r.folderPath }) }, '② メモを組み込んで議事録作成'),
         el('button', { class: 'btn', type: 'button', onclick: () => saveMemosUI({ id: r.sessionId, folderPath: r.folderPath, title: r.title }) }, '📌 メモだけ保存'),
         el('button', { class: 'btn ghost', type: 'button', onclick: () => openDetailByFolder(r.folderPath) }, '詳細'),
         el('button', { class: 'btn ghost', type: 'button', onclick: closeRemote }, 'この会議を閉じる')));
   }
   box.appendChild(card);
+}
+
+async function remoteProcess(r) {
+  try {
+    await ensureMs(true);
+    await requestRemote(r, 'process');
+    toast(`${r.deviceName}に、保存の開始を指示しました`, 'ok');
+    setTimeout(() => {
+      if (S.remote && S.remote.sessionId === r.sessionId && S.remote.status === 'recorded') {
+        toast(`${r.deviceName}から応答がありません。${r.deviceName}でアプリを開き、保存のボタンを押してください。`, 'warn', 9000);
+      }
+    }, 40000);
+  } catch (e) { toast(errorMessage(e), 'error'); }
 }
 
 async function remoteStop(r) {
@@ -315,7 +501,7 @@ async function remoteStop(r) {
 }
 
 function statusLabel(s) {
-  const map = { recording: '録音中', recorded: '録音済み（①未実行）', processing: '①処理中', transcribed: '書き起こし済み（②未実行）', done: '議事録作成済み', error: 'エラー' };
+  const map = { recording: '録音中', importing: '取り込み中', saved: '保存済み（書き起こし待ち）', recorded: '録音済み（未保存）', processing: '①処理中', transcribed: '書き起こし済み（②未実行）', done: '議事録作成済み', error: 'エラー' };
   return map[s.status] || s.status || '';
 }
 
@@ -335,9 +521,22 @@ function renderRec() {
       el('div', { class: 'row' },
         el('button', { class: 'btn', type: 'button', onclick: () => quickMemo('star') }, '★ ここをピン留め'),
         el('button', { class: 'btn', type: 'button', onclick: enterDark }, '画面を黒くする')),
-      holdButton('① 録音を終了して保存・書き起こし', () => handleStop(false), { className: 'danger wide big', enabled: st.recording.holdToStop, hint: '長押しで終了' }),
+      holdButton(st.recording.autoSave ? '録音を終了して保存・書き起こし' : '録音を終了', () => handleStop(false), { className: 'danger wide big', enabled: st.recording.holdToStop, hint: '長押しで終了' }),
+      st.recording.autoSave ? null : el('p', { class: 'muted small' }, '終了しても、すぐには保存しません。終了後に「保存」か「破棄」を選びます。'),
       el('p', { class: 'muted small' }, '録音中は画面をつけたまま、このアプリを表示しておいてください（画面のスリープは自動で防いでいます）。目立たせたくないときは「画面を黒くする」を押してください。2回タップで操作が出ます。')));
     updateMeter();
+    return;
+  }
+  // この端末が待機中：ほかの端末からの録音開始を待つ
+  if (S.standbyAgent) {
+    box.appendChild(el('section', { class: 'card rec-card' },
+      el('h2', {}, '待機中'),
+      el('p', {}, 'ほかの端末の「録音開始」で、この端末の録音が始まります。'),
+      el('p', { class: 'muted small' }, 'このアプリを開いたまま、画面を消さないでください（画面のスリープは自動で防いでいます）。'),
+      el('div', { class: 'row' },
+        el('button', { class: 'btn rec-btn', id: 'btn-start', type: 'button', onclick: () => handleStart() }, el('span', { class: 'dot' }), 'この端末で録音開始'),
+        el('button', { class: 'btn', type: 'button', onclick: enterDark }, '画面を黒くする'),
+        el('button', { class: 'btn ghost', type: 'button', id: 'btn-standby-off', onclick: leaveStandby }, '待機をやめる'))));
     return;
   }
   // 他の端末で録音中のときは、この端末の録音欄を小さくまとめる（押し間違い防止）
@@ -363,7 +562,13 @@ function renderRec() {
   const lastScene = scenes.some(([v]) => v === st.lastScene) ? st.lastScene : 'room';
   const source = el('select', { class: 'input', id: 'in-scene' }, scenes.map(([v, label]) => el('option', { value: v, selected: v === lastScene }, label)));
   const fromCal = st.google.clientId ? el('button', { class: 'btn ghost small', type: 'button', onclick: pickFromCalendar }, '📅 予定から取り込む') : null;
-  const startBtn = el('button', { class: 'btn rec-btn', id: 'btn-start', type: 'button', onclick: handleStart }, el('span', { class: 'dot' }), '録音開始');
+  const startBtn = el('button', { class: 'btn rec-btn', id: 'btn-start', type: 'button', onclick: () => handleStart() }, el('span', { class: 'dot' }), '録音開始');
+  // ほかの端末が待機中なら、その端末の録音をここから始められる
+  const sb = S.remoteStandby;
+  const remoteStartBtn = sb ? el('button', { class: 'btn primary wide', id: 'btn-remote-start', type: 'button', onclick: () => remoteStart(sb) }, `${sb.deviceName}で録音開始（待機中）`) : null;
+  const more = el('div', { class: 'row' },
+    S.status.ms ? el('button', { class: 'btn ghost small', type: 'button', id: 'btn-standby', onclick: enterStandby }, 'ほかの端末からの開始を待つ（待機）') : null,
+    el('button', { class: 'btn ghost small', type: 'button', id: 'btn-import', onclick: importAudioUI }, '音声ファイルを取り込む'));
   box.appendChild(el('section', { class: 'card rec-card' },
     el('h2', {}, '録音'),
     el('div', { class: 'field' }, el('span', {}, '会議名'), el('div', { class: 'row nowrap' }, title, fromCal)),
@@ -373,6 +578,9 @@ function renderRec() {
       el('small', { class: 'muted' }, '「PCのスピーカー」を選ぶと、離れたスピーカーの声を雑音と誤って消さないよう、雑音抑制を自動で切ります。')),
     el('div', { class: 'row' }, conf, diar),
     startBtn,
+    remoteStartBtn,
+    sb ? el('p', { class: 'muted small' }, `「${sb.deviceName}で録音開始」を押すと、上の会議名などを使って、${sb.deviceName}の録音が数秒で始まります。`) : null,
+    more,
     setupHint()));
 }
 
@@ -388,8 +596,7 @@ function setupHint() {
 
 async function pickFromCalendar() {
   try {
-    if (!(await googleTokenValid())) await googleLogin(getSettings().google.clientId, getSettings().google.account);
-    S.status.google = true;
+    await googleInteractive();
     const evs = await eventsAround(new Date());
     if (!evs.length) { toast('前後2時間に予定が見つかりませんでした'); return; }
     const dlg = el('dialog', { class: 'dialog' }, el('h3', {}, '予定から取り込む'),
@@ -404,29 +611,58 @@ async function pickFromCalendar() {
   } catch (e) { toast(errorMessage(e), 'error'); }
 }
 
-async function handleStart() {
-  if (S.rec) return;
+/** 録音の設定欄の内容（ほかの端末に録音開始を指示するときにも使う） */
+function formParams() {
+  const st = getSettings();
+  return {
+    title: (S.setupTitle || '').trim(),
+    projectId: ($('#in-project') || {}).value || st.lastProjectId || 'common',
+    templateId: ($('#in-template') || {}).value || st.lastTemplateId || 'standard',
+    participants: String(S.setupPeople || '').split(/[、,，\s]+/).map((x) => x.trim()).filter(Boolean),
+    confidential: !!S.setupConf,
+    diarization: ($('#in-diar') || { checked: st.transcript.diarization !== false }).checked,
+    scene: ($('#in-scene') || {}).value || st.lastScene || 'room',
+  };
+}
+
+/**
+ * 録音を始める。
+ * opts.params：会議名などの指定（ほかの端末からの開始のとき）。opts.quick：前回と同じ設定ですぐ始める（会議が続くとき）。
+ * opts.remote：ほかの端末からの指示による開始（サインイン画面などは開かない）。
+ */
+async function handleStart(opts = {}) {
+  if (S.rec || S.starting) return;
+  S.starting = true;
   const st = getSettings();
   const btn = $('#btn-start');
   if (btn) btn.disabled = true;
+  const auto = !!(opts.remote || opts.quick);
   try {
+    if (S.standbyAgent) { const a = S.standbyAgent; S.standbyAgent = null; releaseStandbyWake(); await a.stop('off'); }
+    // 前の会議の確認待ちの発信は止める（前の会議は「未保存の録音」に残る）
+    if (S.publisher) { S.publisher.drop(); S.publisher = null; }
+    releasePendingWake();
     let msOk = false;
     if (st.onedrive.clientId) {
-      try { msOk = await ensureMs(true); } catch (e) { toast(`OneDriveに接続できませんでした。端末内に録音します（${errorMessage(e)}）`, 'warn', 6000); }
+      try { msOk = await ensureMs(!auto); } catch (e) { toast(`OneDriveに接続できませんでした。端末内に録音します（${errorMessage(e)}）`, 'warn', 6000); }
     }
-    const projectId = ($('#in-project') || {}).value || 'common';
-    const templateId = ($('#in-template') || {}).value || 'standard';
-    const participants = String(S.setupPeople || '').split(/[、,，\s]+/).map((x) => x.trim()).filter(Boolean);
-    const scene = ($('#in-scene') || {}).value || 'room';
+    const fp = opts.quick ? { title: '', projectId: st.lastProjectId || 'common', templateId: st.lastTemplateId || 'standard', participants: [], confidential: false, diarization: st.transcript.diarization !== false, scene: st.lastScene || 'room' }
+      : { ...formParams(), ...(opts.params || {}) };
+    const projectId = vocab.projectById(fp.projectId) ? fp.projectId : 'common';
+    const templateId = fp.templateId || 'standard';
+    const participants = Array.isArray(fp.participants) ? fp.participants.map((x) => String(x).slice(0, 40)).slice(0, 30) : [];
+    let scene = ['room', 'speaker', 'tab'].includes(fp.scene) ? fp.scene : 'room';
+    if (scene === 'tab' && (auto || isMobile())) scene = 'speaker'; // タブ音声は、その端末での操作が必要なため、指示による開始では使わない
     // 場面ごとのマイクの音声処理：PCのスピーカーの音は雑音抑制・エコー除去で消されやすいので切る
     const audioOverrides = scene === 'speaker' ? { noiseSuppression: false, echoCancellation: false, autoGainControl: true } : {};
     const draft = S.draft;
     const session = {
       id: draft ? draft.id : uuid(),
-      title: (S.setupTitle || '').trim() || `会議 ${fmtDateTime(Date.now())}`,
+      title: String(fp.title || '').trim().slice(0, 120) || `会議 ${fmtDateTime(Date.now())}`,
       projectId, templateId, participants,
-      confidential: !!S.setupConf,
-      diarization: ($('#in-diar') || { checked: true }).checked,
+      confidential: !!fp.confidential,
+      diarization: fp.diarization !== false,
+      startedBy: opts.remote ? (opts.by || 'ほかの端末') : null,
       source: scene === 'tab' ? 'tab' : 'mic',
       scene,
       status: 'recording', createdAt: Date.now(), steps: {},
@@ -439,7 +675,7 @@ async function handleStart() {
     S.warnings = [];
     const rec = new Recorder({
       session, settings: st,
-      onLevel: (db) => { S.level = db; updateMeter(); },
+      onLevel: (db) => { S.level = db; updateMeter(); if (S.bo && S.bo.active) S.bo.setLevel(db); },
       onTick: (sec) => {
         const t = $('#rec-time'); if (t) t.textContent = fmtTime(sec);
         renderHeaderThrottled();
@@ -448,6 +684,11 @@ async function handleStart() {
           S.bo.closeAlert(); S.recAlertCode = null;
           if (!S.bo.active) toast('音声の入力が戻りました', 'ok');
         }
+        // 無音の警告：音が戻ったら閉じる
+        if (S.bo && S.bo.alerting && (S.recAlertCode === 'silent' || S.recAlertCode === 'muted') && S.rec && S.rec.zeroSec < 1 && S.rec.totalSamples > 0 && Date.now() - S.recAlertAt > 2500) {
+          S.bo.closeAlert(); S.recAlertCode = null;
+          if (!S.bo.active) toast('音が入るようになりました', 'ok');
+        }
       },
       onWarning: (code, msg) => {
         S.warnings.push(msg);
@@ -455,6 +696,7 @@ async function handleStart() {
         if (w) { clear(w); S.warnings.slice(-2).forEach((m) => w.appendChild(el('p', { class: 'warn small' }, m))); }
         // 録音が止まった：暗い画面でも気づけるよう、明るい警告と振動で知らせる
         if (code === 'ended' || code === 'stalled') { showRecAlert(code, msg); return; }
+        if (code === 'silent' || code === 'muted') { showSilenceAlert(code); return; }
         if (code === 'storage') { showStorageAlert(msg); return; }
         if (code !== 'hidden' && !(S.bo && S.bo.active)) toast(msg, 'warn', 6000);
       },
@@ -474,11 +716,18 @@ async function handleStart() {
     await saveSettings({ lastProjectId: projectId, lastTemplateId: templateId, lastScene: scene });
     S.setupTitle = ''; S.setupPeople = ''; S.setupConf = false; S.showLocalRec = false;
     S.storageAlerted = false;
+    if (!opts.quick && !opts.params) { /* 設定欄の内容は使い終えた */ }
     render();
-    if (st.recording.blackout && isMobile()) enterDark();
+    const dark = st.recording.darkOnStart;
+    if (S.bo && S.bo.active) { S.bo.hidePanel(); S.bo.holdToStop = st.recording.holdToStop; }
+    else if (dark === 'on' || (dark !== 'off' && isTouchDevice())) enterDark();
+    if (opts.remote) { try { if (navigator.vibrate) navigator.vibrate(120); } catch { /* 無視 */ } }
+    return true;
   } catch (e) {
     toast(errorMessage(e), 'error', 8000);
+    return false;
   } finally {
+    S.starting = false;
     if (btn) btn.disabled = false;
   }
 }
@@ -501,6 +750,7 @@ async function startOnline(session) {
       session,
       getElapsed: () => (S.rec ? S.rec.elapsed : 0),
       onRemoteStop: (c) => { toast(`${c.by || '他の端末'}から終了の指示を受けました`, 'ok'); handleStop(true); },
+      onRemoteProcess: (c) => { if (S.pending) { toast(`${c.by || '他の端末'}から、保存と書き起こしの指示を受けました`, 'ok'); savePending(S.pending); } },
     });
     await S.publisher.start();
     await memos.flushMemos(session.id, session.folderPath).catch(() => {});
@@ -515,30 +765,459 @@ async function handleStop() {
   if (!rec) return;
   S.rec = null;
   const s = S.session;
-  // 黒い画面のまま①に進む（①が終わると通常の画面に戻る）。①を自動で始めない設定なら、ここで戻す
   const st0 = getSettings();
-  if (S.bo) {
-    S.bo.closeAlert(); S.recAlertCode = null;
-    S.darkProc = S.bo.active && st0.recording.autoStep1 && !!st0.onedrive.clientId;
-    if (S.bo.active) { if (S.darkProc) S.bo.hidePanel(); else S.bo.hide(); }
-  }
+  const dark = !!(S.bo && S.bo.active);
+  if (S.bo) { S.bo.closeAlert(); S.recAlertCode = null; S.bo.setLevel(null); }
+  let ok = false;
   try {
     const res = await rec.stop();
     s.startedAt = s.startedAt || res.startedAt || s.createdAt;
     s.durationSec = res.durationSec;
     s.levels = res.levels;
     s.gaps = res.gaps;
+    s.zeroSec = res.zeroSec || 0;
     s.endedAt = s.startedAt + res.durationSec * 1000;
     s.status = 'recorded';
     await putSession(s);
-    if (S.publisher) { await S.publisher.stop('processing'); S.publisher = null; }
-    toast(`録音を終了しました（${fmtTime(res.durationSec)}）`, 'ok');
+    ok = true;
   } catch (e) {
     toast(errorMessage(e), 'error');
   }
+  // 確認なしで保存する設定のとき：そのまま保存へ（黒い画面なら黒いまま進め、終わったら戻す）
+  if (ok && st0.recording.autoSave && st0.onedrive.clientId) {
+    if (S.publisher) { await S.publisher.stop('processing'); S.publisher = null; }
+    S.darkProc = dark;
+    if (dark) S.bo.hidePanel();
+    await refreshUnsaved();
+    render();
+    if (!dark) toast(`録音を終了しました（${fmtTime(s.durationSec)}）`, 'ok');
+    runStep1UI(s);
+    return;
+  }
+  // 既定：保存するか破棄するかを、ボタンで選んでもらう（不要な録音を保存しないため）
+  S.pending = ok ? s : null;
+  if (S.publisher) { try { await S.publisher.hold(); } catch { /* 無視 */ } }
+  holdPendingWake();
+  await refreshUnsaved();
   render();
-  if (getSettings().recording.autoStep1) runStep1UI(s);
-  else endDarkAfterProc();
+  if (dark) S.bo.showPanel(); // 黒い画面のまま、「保存して書き起こす」を出す
+  else if (ok) toast(`録音を終了しました（${fmtTime(s.durationSec)}）。保存するか、破棄するかを選んでください。`, 'ok', 6000);
+  processQueue(); // 録音中は待たせていた書き起こしがあれば、再開する
+}
+
+/** 確認待ちの間、もう一方の端末からの保存の指示を受けられるよう、最長10分は画面を消さない */
+async function holdPendingWake() {
+  releasePendingWake();
+  try { if ('wakeLock' in navigator) S.pendWake = await navigator.wakeLock.request('screen'); } catch { /* 無視 */ }
+  S.pendWakeTimer = setTimeout(releasePendingWake, 10 * 60 * 1000);
+}
+function releasePendingWake() {
+  clearTimeout(S.pendWakeTimer);
+  const w = S.pendWake;
+  S.pendWake = null;
+  try { if (w) w.release().catch(() => {}); } catch { /* 無視 */ }
+}
+
+/** この端末で書き起こしまで行うか（設定「書き起こしを行う端末」。自動＝スマホ・タブレットは保存だけ、PCが書き起こす） */
+function transcribesHere() {
+  const m = getSettings().sync.transcribe;
+  return m === 'yes' || (m !== 'no' && !isTouchDevice());
+}
+const saveLabel = () => (transcribesHere() ? '保存して書き起こす' : '保存する（書き起こしはPCで）');
+
+// ---------------------------------------------------------------------------
+// 未保存の録音（保存するか、破棄するかを選ぶ）
+// ---------------------------------------------------------------------------
+/** 録音は終えたが、まだOneDriveに保存していない（この端末の中だけにある）会議か */
+function isUnsaved(s) {
+  return !!s && s.status === 'recorded' && !(s.steps && s.steps.audio);
+}
+
+async function refreshUnsaved() {
+  try {
+    const busy = new Set([...(S.proc ? [S.proc.sessionId] : []), ...S.queue.map((q) => q.id)]);
+    const list = (await listSessions()).filter((x) => isUnsaved(x) && !busy.has(x.id) && !(S.rec && S.session && S.session.id === x.id));
+    list.sort((a, b) => (b.startedAt || b.createdAt || 0) - (a.startedAt || a.createdAt || 0));
+    S.unsaved = list;
+  } catch { S.unsaved = []; }
+  if (S.pending && !S.unsaved.some((x) => x.id === S.pending.id)) S.pending = null;
+  renderUnsaved();
+}
+
+function renderUnsaved() {
+  const box = $('#unsaved-box');
+  if (!box) return;
+  clear(box);
+  if (!S.unsaved.length) return;
+  const card = el('section', { class: 'card pending-card' },
+    el('h2', {}, S.unsaved.length > 1 ? `まだ保存していない録音（${S.unsaved.length}件）` : '録音を終了しました（まだ保存していません）'),
+    el('p', { class: 'muted small' }, `録音はこの端末の中にあります。必要な録音だけ「${saveLabel()}」を押してください。保存は、次の会議の録音中でも進みます。`));
+  S.unsaved.forEach((u, i) => {
+    const first = i === 0;
+    card.appendChild(el('div', { class: 'unsaved-item' },
+      el('div', {},
+        el('strong', {}, u.title || '（無題）'),
+        el('div', { class: 'muted small' }, `${fmtDateTime(u.startedAt || u.createdAt)}　長さ ${fmtTime(u.durationSec || 0)}${u.imported ? '　取り込み' : ''}`),
+        u.zeroSec >= 10 ? el('div', { class: 'warn small' }, `このうち約${fmtTime(u.zeroSec)}は、まったく音が入っていません。`) : null),
+      el('div', { class: 'row' },
+        el('button', { class: 'btn primary', type: 'button', id: first ? 'btn-save-rec' : null, onclick: () => savePending(u) }, `① ${saveLabel()}`),
+        el('button', { class: 'btn danger', type: 'button', id: first ? 'btn-discard-rec' : null, onclick: () => discardPending(u) }, '破棄'))));
+  });
+  box.appendChild(card);
+}
+
+/** 「保存して書き起こす」：保存の待ち行列に入れる。next＝続けて次の会議の録音を始める */
+async function savePending(s, { next = false } = {}) {
+  if (S.pending && S.pending.id === s.id) S.pending = null;
+  releasePendingWake();
+  if (S.publisher && S.publisher.session.id === s.id) { const p = S.publisher; S.publisher = null; await p.stop('processing').catch(() => {}); }
+  const dark = !!(S.bo && S.bo.active);
+  S.darkProc = dark;
+  if (dark) S.bo.hidePanel();
+  enqueueFor(s);
+  await refreshUnsaved();
+  render();
+  if (next) await handleStart({ quick: true });
+  return processQueue();
+}
+
+/** 「この録音を破棄」：確かめたうえで、端末内の録音と、録音開始時に作ったOneDriveのフォルダを消す */
+async function discardPending(s) {
+  if ((S.proc && S.proc.sessionId === s.id) || S.queue.some((q) => q.id === s.id)) { toast('この録音は、保存の処理中です', 'warn'); return; }
+  const ok = await confirmDialog(`「${s.title}」の録音（${fmtTime(s.durationSec)}）と、この会議のメモを破棄します。元に戻せません。よろしいですか。`, { ok: '破棄する', cancel: 'やめる', danger: true });
+  if (!ok) return;
+  try {
+    if (S.pending && S.pending.id === s.id) S.pending = null;
+    releasePendingWake();
+    if (S.publisher && S.publisher.session.id === s.id) { const p = S.publisher; S.publisher = null; await p.stop('discarded').catch(() => {}); }
+    const r = await pipe.discardSession(s);
+    if (S.session && S.session.id === s.id && !S.rec) { S.session = null; S.myMemos = []; }
+    const note = r.folder === 'failed' ? '（OneDriveの空のフォルダは消せませんでした。OneDriveで削除してください）' : r.folder === 'kept' ? '（OneDriveのフォルダには、ほかのファイルがあったため残しました）' : '';
+    toast(`録音を破棄しました${note}`, r.folder === 'failed' ? 'warn' : 'ok', 7000);
+  } catch (e) {
+    toast(errorMessage(e), 'error', 8000);
+  }
+  await refreshUnsaved();
+  render();
+}
+
+// ---------------------------------------------------------------------------
+// 保存・書き起こしの待ち行列（会議が続いても、録音を止めずに順番に処理する）
+// ---------------------------------------------------------------------------
+function enqueue(s, phase) {
+  if (S.queue.some((q) => q.id === s.id && q.phase === phase)) return;
+  if (S.proc && S.proc.sessionId === s.id && S.proc.kind === 'step1') return;
+  S.queue.push({ id: s.id, session: s, phase });
+}
+
+/** その会議に必要な処理を待ち行列に入れる（保存済みなら書き起こしだけ） */
+function enqueueFor(s, { forceTranscribe = false } = {}) {
+  if (s.steps && s.steps.audio) enqueue(s, 'transcribe');
+  else enqueue(s, transcribesHere() || forceTranscribe ? 'all' : 'save');
+}
+
+/**
+ * 待ち行列を1件ずつ処理する。保存は録音中でも行う。書き起こしは、この端末が録音している間は待つ
+ * （録音を安定させるため。保存だけ先に済ませ、書き起こしは録音の終了後に行う）。
+ */
+async function processQueue() {
+  if (S.proc || S.queueRunning) return;
+  S.queueRunning = true;
+  try {
+    for (;;) {
+      if (S.proc) break;
+      const i = S.queue.findIndex((q) => q.phase !== 'transcribe' || !S.rec);
+      if (i < 0) break;
+      const item = S.queue.splice(i, 1)[0];
+      await runQueueItem(item);
+    }
+  } finally {
+    S.queueRunning = false;
+  }
+  if (!S.proc && !S.queue.some((q) => q.phase !== 'transcribe' || !S.rec)) endDarkAfterProc();
+}
+
+async function runQueueItem(item) {
+  const s = item.session;
+  const st = getSettings();
+  const failQuiet = (msg) => { S.queue = S.queue.filter((q) => q.id !== s.id); toast(msg, 'warn', 8000); };
+  if (!st.onedrive.clientId) { failQuiet('OneDriveを設定すると、保存と書き起こしを実行できます（録音は端末内に保存済み）'); await refreshUnsaved(); render(); return; }
+  try {
+    if (!(await ensureMs(false))) { failQuiet('OneDriveに再サインインしてから、もう一度「保存」を押してください'); await refreshUnsaved(); render(); return; }
+  } catch (e) { failQuiet(errorMessage(e)); await refreshUnsaved(); render(); return; }
+  let phase = item.phase;
+  let reserve = false;
+  if (phase === 'all' && S.rec) {
+    // 録音中：保存だけ先に済ませ、書き起こしは録音の終了後に行う（ほかの端末が先に書き起こさないよう、予約しておく）
+    phase = 'save';
+    reserve = true;
+    S.queue.push({ id: s.id, session: s, phase: 'transcribe' });
+  }
+  const runPhase = phase === 'transcribe' ? 'all' : phase;
+  let chain = false; // 書き起こしに続けて、議事録まで作るか
+  S.proc = { sessionId: s.id, kind: 'step1', phase: runPhase, title: s.title, progress: { text: '開始しています' } };
+  renderProc();
+  await withWakeLock(async () => {
+    try {
+      if (reserve) { s.reservedBy = st.deviceId; s.reservedAt = Date.now(); } else if (runPhase === 'all') { s.reservedBy = null; s.reservedAt = null; }
+      await pipe.runStep1(s, { phase: runPhase, onProgress: (p) => { if (p && S.proc) { S.proc.progress = p; renderProc(); } } });
+      const fell = s.audioInfo && s.audioInfo.note; // 圧縮できず、WAVで保存した
+      if (s.status === 'saved') {
+        if (reserve) toast(`「${s.title}」をOneDriveに保存しました${audioSizeNote(s)}。書き起こしは、録音の終了後に行います。`, 'ok', 6000);
+        else { S.awaiting.set(s.id, s); toast(`「${s.title}」をOneDriveに保存しました${audioSizeNote(s)}。書き起こしは、PCでこのアプリを開くと自動で始まります。`, fell ? 'warn' : 'ok', 8000); }
+      } else {
+        chain = !!(st.minutes && st.minutes.auto) && !(s.steps && s.steps.minutes);
+        toast(chain ? `「${s.title}」の書き起こしが完了しました${audioSizeNote(s)}。続けて議事録を作ります。` : `「${s.title}」の書き起こしが完了しました${audioSizeNote(s)}。「② 議事録作成」を押せます。`, 'ok', 7000);
+      }
+      if (S.remote && S.remote.sessionId === s.id) { S.remoteMeta = pipe.sessionMeta(s); }
+    } catch (e) {
+      S.queue = S.queue.filter((q) => q.id !== s.id);
+      toast(`「${s.title}」の処理で問題が起きました：${errorMessage(e)}`, 'error', 9000);
+    } finally {
+      S.proc = null;
+      await refreshUnsaved();
+      render();
+    }
+  });
+  if (chain) await autoMinutes(s);
+}
+
+/** 設定「議事録まで自動で作る」：書き起こしに続けて②を実行する（サインイン画面は出さない。カレンダーは、つながっていれば登録する） */
+async function autoMinutes(s) {
+  if (S.proc || !(s.steps && s.steps.transcript) || (s.steps && s.steps.minutes)) return;
+  S.proc = { sessionId: s.id, kind: 'step2', title: s.title, progress: { text: '議事録の準備をしています' } };
+  renderProc();
+  await withWakeLock(async () => {
+    try {
+      await pipe.runStep2(s, { onProgress: (p) => { if (p && S.proc) { S.proc.progress = p; renderProc(); } } });
+      if (S.session && S.session.id === s.id) S.session = s;
+      if (S.remote && S.remote.sessionId === s.id) { S.remoteMeta = pipe.sessionMeta(s); }
+      toast(`「${s.title}」の議事録を作成し、OneDriveに保存しました`, 'ok', 7000);
+    } catch (e) {
+      toast(`「${s.title}」の議事録の作成で問題が起きました：${errorMessage(e)}（「② 議事録作成」で、もう一度実行できます）`, 'error', 9000);
+    } finally {
+      S.proc = null;
+      await refreshUnsaved();
+      render();
+    }
+  });
+}
+
+/** 保存した録音データの形式と大きさの一言（例：「（録音データはM4Aで21MB。WAVの約1/5）」） */
+function audioSizeNote(s) {
+  const a = s && s.audioInfo;
+  if (!a || !a.bytes) return '';
+  const mb = (n) => (n >= 10 * 1048576 ? `${Math.round(n / 1048576)}MB` : `${(n / 1048576).toFixed(1)}MB`);
+  if (a.format === 'm4a') return `（録音データはM4Aで${mb(a.bytes)}${a.wavBytes ? `。WAVの約1/${Math.max(1, Math.round(a.wavBytes / a.bytes))}` : ''}）`;
+  return a.note ? `（録音データは圧縮できなかったため、WAVで${mb(a.bytes)}）` : `（録音データはWAVで${mb(a.bytes)}）`;
+}
+
+/** ①のボタン（再試行・一覧・詳細など）から：待ち行列に入れて実行する */
+async function runStep1UI(s, opts = {}) {
+  if (S.queue.some((q) => q.id === s.id) || (S.proc && S.proc.sessionId === s.id)) { toast('この会議は、処理の順番を待っています', 'info'); return; }
+  enqueueFor(s, opts);
+  await refreshUnsaved();
+  render();
+  await processQueue();
+}
+
+/** ほかの端末が保存した会議を、この端末で書き起こす */
+async function transcribeRemote(folderPath, { auto = false } = {}) {
+  try {
+    if (!(await ensureMs(!auto))) return;
+    const s = await pipe.loadRemoteSession(folderPath);
+    if (s.steps && s.steps.transcript) return;
+    if (!auto) toast(`「${s.title}」の書き起こしを始めます`, 'ok');
+    enqueue(s, 'transcribe');
+    if (S.view === 'meeting') { renderRemote(); renderProc(); }
+    processQueue();
+  } catch (e) { if (!auto) toast(errorMessage(e), 'error'); }
+}
+
+/**
+ * PC側：ほかの端末が保存した、書き起こし待ちの会議を見つけて、自動で書き起こす。
+ * 30秒ごと（と、保存の通知を受けたとき）に調べる。処理中・録音中は調べない。
+ */
+async function scanWaiting(force = false) {
+  if (!transcribesHere() || !S.status.ms || !setupStatus().gemini || S.scanning) return;
+  if (S.rec || S.proc || S.queue.length || (document.visibilityState !== 'visible' && !force)) return;
+  S.scanning = true;
+  try {
+    const list = await pipe.findWaitingTranscription();
+    const me = getSettings().deviceId;
+    for (const meta of list) {
+      // ほかの端末が「録音の終了後に自分で書き起こす」と予約している会議は、6時間は手を出さない
+      if (meta.reservedBy && meta.reservedBy !== me && Date.now() - (meta.reservedAt || 0) < 6 * 3600 * 1000) continue;
+      if (S.queue.some((q) => q.id === meta.id)) continue;
+      toast(`${meta.deviceName || 'ほかの端末'}が保存した「${meta.title}」の書き起こしを始めます`, 'ok', 6000);
+      await transcribeRemote(meta.folderPath, { auto: true });
+    }
+  } catch { /* 次回 */ } finally { S.scanning = false; }
+}
+
+/** 録音した端末側：保存した会議が、ほかの端末（PC）で書き起こされたかを確かめる */
+async function pollAwaiting() {
+  if (!S.awaiting.size || !S.status.ms || document.visibilityState !== 'visible') return;
+  for (const [id, s] of [...S.awaiting]) {
+    try {
+      const meta = await od.readJson(metaPath(s.folderPath, 'session.json'));
+      if (!meta) continue;
+      const rank = pipe.statusRank(meta);
+      const autoMin = !!(getSettings().minutes && getSettings().minutes.auto);
+      // 議事録まで自動で作る設定のときは、議事録ができるまで待つ（作成に失敗していたら、書き起こしの時点で知らせる）
+      if (rank >= 4 || (rank === 3 && (!autoMin || meta.error || Date.now() - (meta.updatedAt || 0) > 10 * 60 * 1000))) {
+        S.awaiting.delete(id);
+        const fresh = await pipe.loadRemoteSession(s.folderPath);
+        if (S.session && S.session.id === id && !S.rec) S.session = fresh;
+        toast(rank >= 4 ? `「${fresh.title}」の議事録ができました。一覧から開けます。` : `「${fresh.title}」の書き起こしができました（${meta.processingName || 'ほかの端末'}で作成）。「② 議事録作成」を押せます。`, 'ok', 8000);
+        try { if (navigator.vibrate) navigator.vibrate(150); } catch { /* 無視 */ }
+        if (S.view === 'meeting') render();
+      } else if (meta.status === 'error') {
+        S.awaiting.delete(id);
+        toast(`「${s.title}」の書き起こしで問題が起きました：${meta.error || ''}`, 'warn', 9000);
+      } else if (Date.now() - (s.audioSavedAt || 0) > 24 * 3600 * 1000) {
+        S.awaiting.delete(id);
+      }
+    } catch { /* 次回 */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 待機：ほかの端末から、この端末の録音を始められるようにする
+// ---------------------------------------------------------------------------
+async function enterStandby() {
+  if (S.rec || S.standbyAgent) return;
+  try {
+    if (!(await ensureMs(true))) { toast('待機には、OneDriveへのサインインが必要です', 'warn'); return; }
+    // マイクの許可を先に確かめる（指示を受けてからでは、許可の画面に答えられないため）
+    try {
+      const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+      probe.getTracks().forEach((t) => t.stop());
+    } catch (e) { toast('マイクを使えませんでした。ブラウザのマイクの許可を確認してください。', 'error', 8000); return; }
+    const agent = new StandbyAgent({
+      info: () => ({ lastScene: getSettings().lastScene || 'room', touch: isTouchDevice() }),
+      onStart: (c) => {
+        if (S.standbyAgent !== agent) return;
+        S.standbyAgent = null;
+        releaseStandbyWake();
+        toast(`${c.by || 'ほかの端末'}の指示で、録音を始めます`, 'ok', 5000);
+        handleStart({ params: c.params && typeof c.params === 'object' ? c.params : {}, remote: true, by: c.by });
+      },
+    });
+    S.standbyAgent = agent;
+    await agent.start();
+    try { if ('wakeLock' in navigator) S.standbyWake = await navigator.wakeLock.request('screen'); } catch { /* 無視 */ }
+    render();
+    const dark = getSettings().recording.darkOnStart;
+    if (dark === 'on' || (dark !== 'off' && isTouchDevice())) { blackout().show({ hint: '待機中です。2回タップすると操作が表示されます' }); }
+    else toast('待機を始めました。ほかの端末の「録音開始」で、この端末の録音が始まります。', 'ok', 6000);
+  } catch (e) {
+    S.standbyAgent = null;
+    toast(errorMessage(e), 'error');
+    render();
+  }
+}
+
+function releaseStandbyWake() {
+  const w = S.standbyWake;
+  S.standbyWake = null;
+  try { if (w) w.release().catch(() => {}); } catch { /* 無視 */ }
+}
+
+async function leaveStandby() {
+  const a = S.standbyAgent;
+  S.standbyAgent = null;
+  releaseStandbyWake();
+  if (S.bo && S.bo.active && !S.rec) S.bo.hide();
+  render();
+  if (a) await a.stop('off');
+}
+
+function onRemoteStandby(sb) {
+  S.remoteStandby = sb;
+  if (sb && !S.rec) toast(`${sb.deviceName}が待機中です。ここから${sb.deviceName}の録音を始められます。`, 'info', 5000);
+  if (S.view === 'meeting' && !S.rec) {
+    // 入力中の会議名などを保ったまま、ボタンだけを出し入れする
+    const focusId = document.activeElement && document.activeElement.id;
+    renderRec();
+    if (focusId) { const f = document.getElementById(focusId); if (f) f.focus(); }
+  }
+}
+
+/** 待機中のほかの端末に、録音の開始を指示する */
+async function remoteStart(sb) {
+  const btn = $('#btn-remote-start');
+  if (btn) btn.disabled = true;
+  try {
+    if (!(await ensureMs(true))) return;
+    const params = formParams();
+    if (params.scene === 'tab') params.scene = 'speaker';
+    await requestRemoteStart(sb, params);
+    S.setupTitle = ''; S.setupPeople = ''; S.setupConf = false;
+    toast(`${sb.deviceName}に録音の開始を指示しました（数秒で始まります）`, 'ok', 6000);
+    setTimeout(() => {
+      if (!(S.remote && S.remote.deviceId === sb.deviceId && S.remote.status === 'recording' && Date.now() - S.remote.startedAt < 120000)) {
+        toast(`${sb.deviceName}の録音が始まったことを確認できません。${sb.deviceName}の画面を確かめてください。`, 'warn', 9000);
+      }
+    }, 30000);
+  } catch (e) { toast(errorMessage(e), 'error'); } finally { if (btn) btn.disabled = false; }
+}
+
+// ---------------------------------------------------------------------------
+// 音声ファイルの取り込み（端末の録音アプリやICレコーダーで録った音声）
+// ---------------------------------------------------------------------------
+async function importAudioUI() {
+  const fp = formParams();
+  const draftMemos = S.draft ? (await memos.getMyMemos(S.draft.id)).filter((m) => !m.deleted) : [];
+  const file = el('input', { type: 'file', id: 'imp-file', class: 'input', accept: 'audio/*,.wav,.m4a,.mp3,.aac,.ogg,.flac,.3gp,.amr,.webm' });
+  const title = el('input', { class: 'input', id: 'imp-title', placeholder: '会議名（空欄なら日時）', value: fp.title });
+  const when = el('input', { class: 'input', id: 'imp-when', type: 'datetime-local' });
+  const useDraft = draftMemos.length ? el('input', { type: 'checkbox', checked: true }) : null;
+  const note = el('p', { class: 'muted small' });
+  const run = el('button', { class: 'btn primary', type: 'button', id: 'imp-run', disabled: true }, '取り込む');
+  file.addEventListener('change', () => {
+    const f = file.files && file.files[0];
+    run.disabled = !f;
+    if (!f) return;
+    const wavLike = /\.wav$/i.test(f.name) || /wav/i.test(f.type);
+    note.textContent = `${f.name}（${fmtMB(f.size)}）${!wavLike && f.size > 60 * 1024 * 1024 && isTouchDevice() ? '　大きなファイルです。スマホでは取り込めないことがあります。その場合はPCで取り込んでください。' : ''}`;
+  });
+  const dlg = el('dialog', { class: 'dialog' },
+    el('h3', {}, '音声ファイルを取り込む'),
+    el('p', { class: 'small' }, '端末の録音アプリやICレコーダーで録った音声を取り込みます。取り込んだあとは、このアプリの録音と同じように「保存」「破棄」を選べます。案件・議事録の種類・参加者は、録音の設定欄の内容を使います。'),
+    el('label', { class: 'field' }, el('span', {}, '音声ファイル（WAV・m4a・mp3 など）'), file),
+    note,
+    el('label', { class: 'field' }, el('span', {}, '会議名'), title),
+    el('label', { class: 'field' }, el('span', {}, '録音を始めた日時（空欄なら、ファイルの時刻と長さから推定します）'), when),
+    useDraft ? el('label', { class: 'check' }, useDraft, `いま書いてあるメモ（${draftMemos.length}件）を、この録音に付ける（メモを書いた時刻で、録音の位置と結び付けます）`) : null,
+    el('div', { class: 'row end' },
+      el('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, 'やめる'),
+      run));
+  run.addEventListener('click', async () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    run.disabled = true;
+    run.textContent = '取り込んでいます…';
+    try {
+      const startedAt = when.value ? new Date(when.value).getTime() : null;
+      const attach = !!(useDraft && useDraft.checked && S.draft);
+      const s = await pipe.importAudioFile(f, { ...fp, id: attach ? S.draft.id : undefined, title: title.value, startedAt: Number.isFinite(startedAt) ? startedAt : null });
+      if (attach) { await memos.fixOffsets(s); S.draft = null; S.myMemos = []; }
+      S.pending = s;
+      S.setupTitle = '';
+      dlg.close();
+      toast(`音声を取り込みました（${fmtTime(s.durationSec)}、録音開始 ${fmtDateTime(s.startedAt)}）。保存するか、破棄するかを選んでください。`, 'ok', 8000);
+      await refreshUnsaved();
+      render();
+    } catch (e) {
+      toast(errorMessage(e), 'error', 9000);
+      run.disabled = false;
+      run.textContent = '取り込む';
+    }
+  });
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.appendChild(dlg);
+  dlg.showModal();
 }
 
 // ---------------------------------------------------------------------------
@@ -549,8 +1228,11 @@ function blackout() {
     S.bo = new Blackout({
       getStatus: () => {
         if (S.rec) return { mode: 'rec', elapsed: S.rec.elapsed, saved: S.rec.savedSec, notes: S.warnings };
+        if (S.standbyAgent) return { mode: 'standby' };
+        if (S.pending && !S.proc) return { mode: 'done', duration: S.pending.durationSec, saveLabel: saveLabel() };
         const p = (S.proc && S.proc.progress) || {};
-        return { mode: 'proc', progressText: S.proc ? `${S.proc.kind === 'step1' ? '① 保存・書き起こし中' : '② 議事録を作成中'}：${p.text || ''}` : '処理を準備しています', progressRatio: p.ratio || 0 };
+        const head = S.proc ? (S.proc.kind === 'step2' ? '② 議事録を作成中' : S.proc.phase === 'save' ? 'OneDriveに保存中' : '① 保存・書き起こし中') : '';
+        return { mode: 'proc', progressText: S.proc ? `${head}：${p.text || ''}` : '処理を準備しています', progressRatio: p.ratio || 0 };
       },
       onPin: () => quickMemo('star'),
       onMemo: () => {
@@ -562,6 +1244,11 @@ function blackout() {
         setTimeout(focusMemo, 50);
       },
       onStop: () => handleStop(false),
+      onSave: () => { if (S.pending) savePending(S.pending); },
+      onSaveNext: () => { if (S.pending) savePending(S.pending, { next: true }); },
+      onNext: () => handleStart({ quick: true }),
+      onStandbyStart: () => handleStart(),
+      onStandbyStop: () => leaveStandby(),
       onExit: () => { S.darkProc = false; render(); },
     });
   }
@@ -574,10 +1261,11 @@ function enterDark() {
   b.show({ hint: true });
 }
 
-/** ①が終わったら、黒い画面をやめて短く振動で知らせる */
+/** 処理が終わったら、黒い画面をやめて短く振動で知らせる（録音中・待機中は黒いままにする） */
 function endDarkAfterProc() {
   if (!S.darkProc) return;
   S.darkProc = false;
+  if (S.rec || S.standbyAgent || S.pending) return;
   if (S.bo && S.bo.active) {
     S.bo.hide();
     try { if (navigator.vibrate) navigator.vibrate(150); } catch { /* 無視 */ }
@@ -586,8 +1274,9 @@ function endDarkAfterProc() {
 
 function showRecAlert(code, msg) {
   const b = blackout();
-  if (b.alerting || !S.rec) return;
+  if ((b.alerting && !b.quiet) || !S.rec) return; // 「無音」の帯が出ていても、録音が止まった警告は必ず出す
   S.recAlertCode = code;
+  S.recAlertAt = Date.now();
   b.alert({
     title: '録音が止まりました',
     message: `${msg}${fmtTime(S.rec.savedSec)}までは端末に保存されています。`,
@@ -607,11 +1296,41 @@ function showRecAlert(code, msg) {
   });
 }
 
+/**
+ * まったく音が入っていない（マイクの消音、別のマイクへの切り替わりなど）：
+ * 画面は暗いまま、下の小さな帯「無音」と短い振動で、控えめに知らせる（周りから目立たないことを優先）。
+ * 音が入るようになると、帯は自動で消える。
+ */
+function showSilenceAlert(code) {
+  const b = blackout();
+  if (b.alerting || !S.rec) return;
+  S.recAlertCode = code;
+  S.recAlertAt = Date.now();
+  b.notice({
+    label: '無音',
+    describe: '無音が続いています。音が入るようになると、この表示は自動で消えます。',
+    getElapsed: () => (S.rec ? S.rec.zeroSec : 0),
+    primary: 'つなぎ直す',
+    onPrimary: async () => {
+      try {
+        await S.rec.restartInput();
+        b.closeAlert(); S.recAlertCode = null;
+        if (!b.active) toast('マイクをつなぎ直しました', 'ok', 4000);
+      } catch (e) {
+        b.closeAlert();
+        showRecAlert('ended', `${errorMessage(e)} `);
+      }
+    },
+    secondary: 'このまま',
+    onSecondary: async () => { if (S.rec) S.rec.ignoreSilence(); b.closeAlert(); S.recAlertCode = null; },
+  });
+}
+
 function showStorageAlert(msg) {
   if (S.storageAlerted || !S.rec) return;
-  S.storageAlerted = true;
   const b = blackout();
-  if (b.alerting) return;
+  if (b.alerting && !b.quiet) return;
+  S.storageAlerted = true;
   b.alert({
     title: '端末に保存できませんでした',
     message: `${msg}録音は続いていますが、保存できなかった部分は失われるおそれがあります。`,
@@ -628,40 +1347,13 @@ async function withWakeLock(fn) {
   try { return await fn(); } finally { try { if (wake) await wake.release(); } catch { /* 無視 */ } }
 }
 
-async function runStep1UI(s) {
-  try {
-    await runStep1Inner(s);
-  } finally {
-    endDarkAfterProc();
-  }
-}
-
-async function runStep1Inner(s) {
-  if (S.proc) { toast('別の処理が実行中です', 'warn'); return; }
-  if (!getSettings().onedrive.clientId) { toast('OneDriveを設定すると、保存と書き起こしを実行できます（録音は端末内に保存済み）', 'warn', 7000); return; }
-  try { if (!(await ensureMs(false))) { toast('OneDriveに再サインインしてから「再試行」を押してください', 'warn', 7000); render(); return; } } catch (e) { toast(errorMessage(e), 'error'); return; }
-  S.proc = { sessionId: s.id, kind: 'step1', progress: { text: '開始しています' } };
-  renderProc();
-  await withWakeLock(async () => {
-    try {
-      await pipe.runStep1(s, { onProgress: (p) => { if (p && S.proc) { S.proc.progress = p; renderProc(); } } });
-      toast('書き起こしが完了しました。続けて「② 議事録作成」を押せます。', 'ok', 7000);
-    } catch (e) {
-      toast(`①で問題が起きました：${errorMessage(e)}`, 'error', 9000);
-    } finally {
-      S.proc = null;
-      render();
-    }
-  });
-}
-
 async function runStep2UI(target) {
   if (S.proc) { toast('別の処理が実行中です', 'warn'); return; }
   const st = getSettings();
   try {
     // ボタンを押した直後でないと認証画面がブロックされるため、通信を伴うOneDriveの確認より先に行う
     if (st.google.clientId && st.google.autoCalendar && !(await googleTokenValid())) {
-      try { await googleLogin(st.google.clientId, st.google.account); S.status.google = true; } catch { /* カレンダーなしで続行 */ }
+      try { await googleInteractive(); } catch { /* カレンダーなしで続行 */ }
     }
     if (!(await ensureMs(true))) { toast('OneDriveの設定が必要です', 'warn'); return; }
   } catch (e) { toast(errorMessage(e), 'error'); return; }
@@ -679,12 +1371,14 @@ async function runStep2UI(target) {
       toast(`議事録を作成し、OneDriveに保存しました${learned}`, 'ok', 7000);
       S.proc = null;
       openDetail(s, 'minutes');
+      processQueue();
       return;
     } catch (e) {
       toast(`②で問題が起きました：${errorMessage(e)}`, 'error', 9000);
     } finally {
       S.proc = null;
       if (S.view !== 'detail') render(); else renderDetailBody();
+      processQueue();
     }
   });
 }
@@ -701,23 +1395,33 @@ function renderProc() {
   const box = $('#proc-box');
   if (!box) { if (S.view === 'detail') renderDetailBody(); return; }
   clear(box);
+  const waiting = S.queue.length;
+  const waitLine = waiting ? el('p', { class: 'queue-line', id: 'queue-line' }, `このあとの処理待ち：${waiting}件${S.rec && S.queue.some((q) => q.phase === 'transcribe') ? '（書き起こしは、録音の終了後に行います）' : ''}`) : null;
   if (S.proc) {
     const p = S.proc.progress || {};
-    box.appendChild(el('section', { class: 'card' },
-      el('h2', {}, S.proc.kind === 'step1' ? '① 保存・書き起こし中' : '② 議事録を作成中'),
+    const head = S.proc.kind === 'step2' ? '② 議事録を作成中' : S.proc.phase === 'save' ? 'OneDriveに保存中' : '① 保存・書き起こし中';
+    box.appendChild(el('section', { class: 'card', id: 'proc-card' },
+      el('h2', {}, head),
+      S.proc.title ? el('p', { class: 'muted small' }, `会議：${S.proc.title}`) : null,
       el('p', {}, p.text || ''),
       progressBar(p.ratio),
-      el('p', { class: 'muted small' }, '完了まで画面をつけたままにしてください。')));
+      waitLine,
+      el('p', { class: 'muted small' }, '完了まで画面をつけたままにしてください。次の会議の録音は、いつでも始められます。')));
     return;
   }
+  if (waitLine) box.appendChild(el('section', { class: 'card' }, waitLine));
   const s = S.session;
   if (!s || S.rec) return;
+  if (isUnsaved(s) || s.status === 'importing') return; // 保存前の録音は「まだ保存していない録音」の欄に出す
   const card = el('section', { class: 'card' }, el('h2', {}, `直前の会議：${s.title}`),
     el('p', {}, `${fmtDateTime(s.startedAt)}　${fmtTime(s.durationSec)}　${statusLabel(s)}`),
     s.error ? el('p', { class: 'warn small' }, s.error) : null,
     s.calendarPending ? el('p', { class: 'muted small' }, 'カレンダーは、②の実行時か「カレンダー登録」で登録します。') : null);
   const row = el('div', { class: 'row' });
-  if (!(s.steps && s.steps.transcript)) row.appendChild(el('button', { class: 'btn primary', type: 'button', onclick: () => runStep1UI(s) }, s.status === 'error' ? '① を再試行' : '① 保存・書き起こし'));
+  if (s.status === 'saved') {
+    card.appendChild(el('p', { class: 'muted small' }, '録音はOneDriveに保存済みです。書き起こしは、PCでこのアプリを開くと自動で始まります。できあがると、ここでお知らせします。'));
+    row.appendChild(el('button', { class: 'btn', type: 'button', id: 'btn-transcribe-here', onclick: () => runStep1UI(s) }, 'この端末で書き起こす'));
+  } else if (!(s.steps && s.steps.transcript)) row.appendChild(el('button', { class: 'btn primary', type: 'button', onclick: () => runStep1UI(s, { forceTranscribe: s.status === 'error' && !!(s.steps && s.steps.audio) }) }, s.status === 'error' ? '① を再試行' : '① 保存・書き起こし'));
   else row.appendChild(el('button', { class: 'btn primary', type: 'button', onclick: () => runStep2UI(s) }, s.steps.minutes ? '② 議事録を作り直す' : '② メモを組み込んで議事録作成'));
   row.appendChild(el('button', { class: 'btn', type: 'button', onclick: () => saveMemosUI(s) }, '📌 メモだけ保存'));
   row.appendChild(el('button', { class: 'btn ghost', type: 'button', onclick: () => openDetail(s) }, '詳細'));
@@ -894,7 +1598,7 @@ function renderListItems() {
 async function openListItem(s) {
   try {
     const local = await getSession(s.id);
-    if (local && (local.transcript || !s.folderPath)) { openDetail(local); return; }
+    if (local && (local.transcript || !s.folderPath) && !s.remoteNewer) { openDetail(local); return; }
     await openDetailByFolder(s.folderPath);
   } catch (e) { toast(errorMessage(e), 'error'); }
 }
@@ -954,7 +1658,7 @@ async function openDetail(s, tab = 'transcript') {
   try {
     const chunks = await getChunks(s.id);
     if (chunks.length) S.audioUrl = URL.createObjectURL(wavFromPcmBlob(pcmBlobFromChunks(chunks)));
-    else if (s.folderPath && S.status.ms) S.audioUrl = await od.downloadUrl(od.joinPath(s.folderPath, '録音データ.wav'));
+    else if (s.folderPath && S.status.ms) S.audioUrl = await pipe.audioUrl(s); // M4A（圧縮）かWAVの、あるほうを再生する
     const a = $('#player');
     if (a && S.audioUrl) a.src = S.audioUrl;
   } catch { /* 音声なしで表示 */ }
@@ -994,18 +1698,22 @@ function viewDetail() {
   });
   const st = getSettings();
   const actions = el('div', { class: 'row' },
-    !(s.steps && s.steps.transcript) ? el('button', { class: 'btn primary', type: 'button', disabled: !!S.proc, onclick: () => runStep1UI(s) }, '① 保存・書き起こし') : null,
+    !(s.steps && s.steps.transcript) ? el('button', { class: 'btn primary', type: 'button', disabled: !!(S.proc && S.proc.sessionId === s.id), onclick: () => runStep1UI(s) }, s.steps && s.steps.audio ? '① 書き起こす（この端末で）' : `① ${saveLabel()}`) : null,
     s.steps && s.steps.transcript ? el('button', { class: 'btn primary', type: 'button', disabled: !!S.proc, onclick: () => runStep2UI(s) }, s.minutes ? '② 議事録を作り直す' : '② 議事録作成') : null,
     s.transcript ? el('button', { class: 'btn', type: 'button', onclick: () => renameSpeakersUI(s) }, '話者名を変更') : null,
     el('button', { class: 'btn', type: 'button', onclick: () => calendarUI(s) }, '📅 カレンダー登録'),
     s.folderWebUrl ? el('a', { class: 'btn ghost', href: s.folderWebUrl, target: '_blank', rel: 'noopener noreferrer' }, 'OneDriveで開く') : null,
+    // まだOneDriveに保存していない録音（この端末の中だけにある）は、ここから破棄できる
+    !(s.steps && s.steps.audio) && s.where !== 'remote' && s.status !== 'recording' && s.status !== 'processing'
+      ? el('button', { class: 'btn danger', type: 'button', disabled: !!S.proc, onclick: async () => { await discardPending(s); if (!(await getSession(s.id))) go('list'); } }, 'この録音を破棄') : null,
     el('button', { class: 'btn ghost', type: 'button', onclick: () => go('list') }, '一覧へ戻る'));
-  wrap.append(
+  appendAll(wrap, 
     el('section', { class: 'card' },
       el('h2', {}, s.title || '（無題）'),
       el('p', { class: 'muted' }, `${fmtDateTime(s.startedAt)}　${fmtTime(s.durationSec || 0)}　${statusLabel(s)}${s.confidential ? '　🔒機密' : ''}${s.deviceName ? `　録音：${s.deviceName}` : ''}`),
       s.error ? el('p', { class: 'warn small' }, s.error) : null,
       player,
+      s.audioInfo && s.audioInfo.bytes ? el('p', { class: `small ${s.audioInfo.note ? 'warn' : 'muted'}`, id: 'audio-info' }, `OneDriveの録音データ：${s.audioFile || ''}${audioSizeNote(s)}`) : null,
       el('div', { class: 'row' }, el('label', { class: 'check' }, skip, '無音を飛ばす'), speed,
         el('button', { class: 'btn small ghost', type: 'button', onclick: () => jumpStar(1) }, '次の★へ'),
         el('button', { class: 'btn small ghost', type: 'button', onclick: () => jumpStar(-1) }, '前の★へ')),
@@ -1146,7 +1854,7 @@ function detailMinutes(s) {
   }
   if (S.editMinutes) {
     const ta = el('textarea', { class: 'input minutes-edit', rows: 24 }, s.minutes.markdown);
-    card.append(
+    appendAll(card, 
       el('p', { class: 'muted small' }, '直した内容から、用語と書き方のルールを学び、次回以降に反映します。'),
       ta,
       el('div', { class: 'row end' },
@@ -1164,7 +1872,7 @@ function detailMinutes(s) {
         }, '保存して学習')));
     return card;
   }
-  card.append(
+  appendAll(card, 
     el('div', { class: 'row between' },
       el('span', { class: 'muted small' }, s.minutes.flagged || s.minutes.weak
         ? `⚠根拠未確認 ${s.minutes.flagged || 0}件、△内容要確認 ${s.minutes.weak || 0}件。[MM:SS]を押して発言を確かめてください。`
@@ -1331,7 +2039,7 @@ function detailMaterials(s) {
       renderDetailBody();
     },
   });
-  card.append(el('p', { class: 'muted small' }, 'PDF・画像・テキストに対応しています。議事録の作成時に読み込み、専門用語は単語帳に自動で追加します。'), input);
+  appendAll(card, el('p', { class: 'muted small' }, 'PDF・画像・テキストに対応しています。議事録の作成時に読み込み、専門用語は単語帳に自動で追加します。'), input);
   const box = el('div', { class: 'list' });
   card.appendChild(box);
   (async () => {
@@ -1370,8 +2078,7 @@ async function calendarUI(s) {
     return;
   }
   try {
-    if (!(await googleTokenValid())) await googleLogin(st.google.clientId, st.google.account);
-    S.status.google = true;
+    await googleInteractive();
     if (!s.folderPath) await pipe.ensureFolder(s);
     if (!s.folderWebUrl && s.folderPath) s.folderWebUrl = await od.webUrl(s.folderPath);
     const ok = await pipe.tryCalendar(s, s.minutes && s.minutes.data);
@@ -1441,7 +2148,7 @@ function viewVocab() {
     const m = tp.monthlySummary(usage);
     const budget = Number(getSettings().budget.monthlyUsd) || 10;
     const ratio = Math.min(1, m.cost / budget);
-    usageBox.append(
+    appendAll(usageBox, 
       el('p', {}, `今月のAI利用：${m.calls}回、音声${Math.round(m.audioSec / 60)}分、推定費用 約${m.cost.toFixed(2)}ドル（予算${budget}ドルの${Math.round(ratio * 100)}%）`),
       progressBar(ratio),
       el('p', { class: 'muted small' }, '推定費用は公開単価からの概算です。正確な金額はGoogle Cloudの請求画面で確認してください。'));
@@ -1519,6 +2226,13 @@ function viewSettings() {
       el('button', { class: 'btn primary', type: 'button', onclick: async () => { await saveSettings({ google: { clientId: gClient.value.trim(), account: gAcc.value.trim(), autoCalendar: gAuto.checked }, privacy: { calendarSummary: gSum.checked } }); await pushShared(); if (gClient.value.trim()) { try { await googleLogin(gClient.value.trim(), gAcc.value.trim()); S.status.google = true; toast('Googleカレンダーを連携しました', 'ok'); } catch (e) { toast(errorMessage(e), 'error'); } } render(); } }, '保存して連携'),
       st.google.clientId ? el('button', { class: 'btn ghost', type: 'button', onclick: async () => { await googleLogout(); S.status.google = false; render(); } }, '連携を解除') : null)));
 
+  // サインインの自動更新
+  const renew = el('input', { type: 'checkbox', id: 'set-auto-renew', checked: st.connection.autoRenew !== false });
+  renew.addEventListener('change', async () => { await saveSettings({ connection: { autoRenew: renew.checked } }); toast('保存しました', 'ok'); if (renew.checked) keepConnections({ startup: true }); });
+  wrap.appendChild(section('サインインの自動更新',
+    el('label', { class: 'check' }, renew, 'OneDrive・Googleカレンダーのサインインを、切れる前に自動でつなぎ直す'),
+    el('p', { class: 'muted small' }, 'ブラウザだけで動くアプリは、サービス側の決まりで、OneDriveは約24時間、Googleカレンダーは約1時間でサインインが切れます。この設定を入れておくと、アプリを開いたときと、開いている間に、画面を出さずにつなぎ直します。端末によっては、アプリを開いた直後に画面が一瞬切り替わることがあります。ブラウザ側でMicrosoft・Googleからサインアウトした場合は、もう一度サインインが必要です。')));
+
   // ほかの端末（スマホなど）を設定する
   const withKey = el('input', { type: 'checkbox', checked: true });
   wrap.appendChild(section('ほかの端末（スマホなど）を設定する',
@@ -1530,11 +2244,18 @@ function viewSettings() {
   // 録音・書き起こし・メモ
   const r = st.recording;
   const cb = (v) => el('input', { type: 'checkbox', checked: v });
-  const hp = cb(r.highpass); const ns = cb(r.noiseSuppression); const agc = cb(r.autoGainControl); const ec = cb(r.echoCancellation); const hold = cb(r.holdToStop); const auto1 = cb(r.autoStep1); const dark = cb(r.blackout !== false);
+  const hp = cb(r.highpass); const ns = cb(r.noiseSuppression); const agc = cb(r.autoGainControl); const ec = cb(r.echoCancellation); const hold = cb(r.holdToStop); const auto1 = cb(!!r.autoSave);
+  const dark = el('select', { class: 'input' },
+    [['auto', '自動（スマホ・タブレットで録音するときだけ黒くする）'], ['on', 'いつも黒くする（PCでも）'], ['off', '黒くしない']].map(([v, label]) => el('option', { value: v, selected: (r.darkOnStart || 'auto') === v }, label)));
   const filler = el('select', { class: 'input' }, el('option', { value: 'standard', selected: st.transcript.fillerLevel === 'standard' }, '標準（えー・あのー等を除く）'), el('option', { value: 'none', selected: st.transcript.fillerLevel === 'none' }, 'そのまま（一字一句）'));
   const phrases = el('textarea', { class: 'input', rows: 4 }, (st.memo.phrases || []).join('\n'));
   const devName = inp(st.deviceName);
   const poll = inp(st.sync.pollSec, { type: 'number', min: '3', max: '60' });
+  const autoMin = el('input', { type: 'checkbox', id: 'set-auto-minutes', checked: !!(st.minutes && st.minutes.auto) });
+  const audioFmt = el('select', { class: 'input', id: 'set-audio-format' },
+    [['m4a', 'M4A（圧縮して小さくする。スマホやPCの標準のプレーヤーで再生できます）'], ['wav', 'WAV（圧縮しない。大きさは約5倍）']].map(([v, label]) => el('option', { value: v, selected: (st.recording.audioFormat || 'm4a') === v }, label)));
+  const trSel = el('select', { class: 'input', id: 'set-transcribe' },
+    [['auto', '自動（スマホ・タブレットは保存だけ。PCが書き起こす）'], ['yes', 'この端末で書き起こす'], ['no', 'この端末では書き起こさない（保存だけ）']].map(([v, label]) => el('option', { value: v, selected: (st.sync.transcribe || 'auto') === v }, label)));
   wrap.appendChild(section('録音・書き起こし・メモ',
     f('この端末の名前', devName, 'もう一方の端末に「○○で録音中」と表示されます。'),
     el('label', { class: 'check' }, hp, '低い雑音（空調・机の振動）を除く'),
@@ -1542,20 +2263,24 @@ function viewSettings() {
     el('label', { class: 'check' }, agc, '音量を自動で調整する'),
     el('label', { class: 'check' }, ec, 'エコー除去（スピーカーで会議音声を流しながら同じ端末で録る場合のみ）'),
     el('label', { class: 'check' }, hold, '録音の終了は長押しで行う（誤タップ防止）'),
-    el('label', { class: 'check' }, auto1, '録音を終了したら、自動で①（保存・書き起こし）を始める'),
-    el('label', { class: 'check' }, dark, 'スマホでは、録音を始めたら画面を黒くする（2回タップで操作を表示。録音が止まったときだけ明るくして振動で知らせます）'),
+    el('label', { class: 'check' }, auto1, '録音を終了したら、確認なしで①（保存・書き起こし）を始める（外すと、終了後に「保存して書き起こす」か「破棄」を選びます）'),
+    f('録音を始めたときの画面', dark, '黒い画面では、2回タップで操作が出ます。録音が止まったときだけ、明るくして振動で知らせます。'),
     f('ケバ取り', filler),
     f('定型句（1行に1つ）', phrases),
+    f('OneDriveに保存する録音データの形式', audioFmt, 'M4Aは、1時間の録音で約20MB（WAVは約115MB）です。保存にかかる時間と通信量が減ります。端末によっては約40MBになります（16kHzのまま圧縮できない端末）。圧縮に対応していない端末や、圧縮後の確認に失敗したときは、自動でWAVで保存します。書き起こしは、圧縮する前の音声で行います（ほかの端末が書き起こす場合は、圧縮した音声を使います）。'),
+    f('書き起こしを行う端末', trSel, 'スマホは保存だけにすると、画面をつけておく時間が短くなります。書き起こしは、PCでこのアプリを開いている間に自動で行われます。'),
+    el('label', { class: 'check' }, autoMin, '書き起こしが終わったら、続けて議事録（②）まで自動で作る（外すと、メモを書き足してから②を押します。自動で作った後も「② 議事録を作り直す」でメモを反映できます）'),
     f('2台の同期の間隔（秒）', poll),
     el('button', {
       class: 'btn primary', type: 'button',
       onclick: async () => {
         await saveSettings({
           deviceName: devName.value.trim() || st.deviceName,
-          recording: { highpass: hp.checked, noiseSuppression: ns.checked, autoGainControl: agc.checked, echoCancellation: ec.checked, holdToStop: hold.checked, autoStep1: auto1.checked, blackout: dark.checked },
+          recording: { highpass: hp.checked, noiseSuppression: ns.checked, autoGainControl: agc.checked, echoCancellation: ec.checked, holdToStop: hold.checked, autoSave: auto1.checked, darkOnStart: dark.value, audioFormat: audioFmt.value },
           transcript: { fillerLevel: filler.value },
           memo: { phrases: phrases.value.split('\n').map((x) => x.trim()).filter(Boolean) },
-          sync: { pollSec: Math.max(3, Number(poll.value) || 5) },
+          sync: { pollSec: Math.max(3, Number(poll.value) || 5), transcribe: trSel.value },
+          minutes: { auto: autoMin.checked },
         });
         await pushShared();
         toast('保存しました', 'ok');
@@ -1574,7 +2299,7 @@ function viewSettings() {
       el('label', { class: 'btn' }, '設定を読み込む', el('input', { type: 'file', accept: 'application/json', class: 'hidden', onchange: importSettings })),
       el('button', { class: 'btn danger', type: 'button', onclick: wipeLocal }, '端末内のデータを消去'))));
 
-  wrap.appendChild(el('p', { class: 'muted small center' }, `端末ID：${st.deviceId}　／　AI会議録音＆OneDrive自動議事録 v2.3`));
+  wrap.appendChild(el('p', { class: 'muted small center' }, `端末ID：${st.deviceId}　／　AI会議録音＆OneDrive自動議事録 v${APP_VERSION.replace(/\.0$/, '')}`));
   return wrap;
 }
 

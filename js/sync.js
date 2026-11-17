@@ -7,6 +7,8 @@ import { getSettings } from './settings.js';
 export const rootPath = () => getSettings().onedrive.rootPath || '会議録音アーカイブ';
 export const livePath = () => od.joinPath(rootPath(), '_live.json');
 export const metaPath = (folderPath, name) => od.joinPath(folderPath, '_meta', name);
+export const standbyPath = () => od.joinPath(rootPath(), '_standby.json'); // 待機中の端末（ほかの端末からの録音開始を待つ）
+export const startPath = () => od.joinPath(rootPath(), '_start.json');     // 待機中の端末への、録音開始の指示
 
 /** 変更があったときだけ JSON を読む */
 export async function readJsonIfChanged(path, lastETag) {
@@ -25,12 +27,13 @@ export async function readJsonIfChanged(path, lastETag) {
 // 録音する端末側：状況の発信と、遠隔停止の受信
 // ---------------------------------------------------------------------------
 export class LivePublisher {
-  constructor({ session, getElapsed, onRemoteStop, onError }) {
+  constructor({ session, getElapsed, onRemoteStop, onRemoteProcess, onError }) {
     this.session = session;
     this.getElapsed = getElapsed;
     this.onRemoteStop = onRemoteStop;
+    this.onRemoteProcess = onRemoteProcess || (() => {});
     this.onError = onError || (() => {});
-    this.stopped = false;
+    this.phase = 'recording'; // recording → stopping → recorded（保存するかの確認待ち）→ ended
     this.controlETag = null;
   }
 
@@ -58,20 +61,39 @@ export class LivePublisher {
   }
 
   async checkControl() {
-    if (this.stopped || !this.session.folderPath) return;
+    if (this.phase === 'ended' || this.phase === 'stopping' || !this.session.folderPath) return;
     try {
       const res = await readJsonIfChanged(metaPath(this.session.folderPath, 'control.json'), this.controlETag);
       if (res.eTag) this.controlETag = res.eTag;
       const c = res.data;
-      if (c && c.command === 'stop' && c.sessionId === this.session.id && !this.stopped) {
-        this.stopped = true;
+      if (!c || c.sessionId !== this.session.id) return;
+      if (c.command === 'stop' && this.phase === 'recording') {
+        this.phase = 'stopping';
         this.onRemoteStop(c);
+      } else if (c.command === 'process' && this.phase === 'recorded') {
+        this.phase = 'stopping';
+        this.onRemoteProcess(c);
       }
     } catch (e) { this.onError(e); }
   }
 
+  /** 録音を終え、保存するかの確認を待つ間：状態を「録音済み」と発信し、もう一方の端末からの保存の指示を待つ */
+  async hold() {
+    this.phase = 'recorded';
+    clearInterval(this.hb);
+    this.hb = setInterval(() => this.write('recorded'), 15000);
+    await this.write('recorded');
+  }
+
+  /** 何も書き込まずに終える（次の会議の録音を始めるとき。前の会議の状態は上書きされる） */
+  drop() {
+    this.phase = 'ended';
+    clearInterval(this.hb);
+    clearInterval(this.ctl);
+  }
+
   async stop(status = 'stopped') {
-    this.stopped = true;
+    this.phase = 'ended';
     clearInterval(this.hb);
     clearInterval(this.ctl);
     await this.write(status);
@@ -82,18 +104,21 @@ export class LivePublisher {
 // もう一方の端末側：録音中の会議を見つける
 // ---------------------------------------------------------------------------
 export class LiveWatcher {
-  constructor({ onChange, onError }) {
+  constructor({ onChange, onStandby, onError }) {
     this.onChange = onChange;
+    this.onStandby = onStandby || (() => {});
     this.onError = onError || (() => {});
     this.eTag = null;
     this.current = null;
     this.timer = null;
+    this.standbyETag = null;
+    this.standby = null;
   }
 
   start() {
     if (this.timer) return;
     const tick = async () => {
-      if (document.visibilityState === 'visible') await this.check();
+      if (document.visibilityState === 'visible') { await this.check(); await this.checkStandby(); }
       const poll = Math.max(3, Number(getSettings().sync.pollSec) || 5) * 1000;
       this.timer = setTimeout(tick, poll);
     };
@@ -101,6 +126,24 @@ export class LiveWatcher {
   }
 
   stop() { clearTimeout(this.timer); this.timer = null; }
+
+  /** ほかの端末が「待機中」（こちらから録音を開始できる状態）かを調べる */
+  async checkStandby() {
+    try {
+      const res = await readJsonIfChanged(standbyPath(), this.standbyETag);
+      if (res.eTag) this.standbyETag = res.eTag;
+      let sb = res.unchanged ? this.standbyRaw : (res.data || null);
+      this.standbyRaw = sb;
+      const mine = sb && sb.deviceId === getSettings().deviceId;
+      // 待機中の端末は20秒ごとに発信する。70秒以上途絶えたら、待機していないとみなす
+      const fresh = sb && sb.status === 'standby' && Date.now() - sb.heartbeat < 70_000;
+      sb = sb && !mine && fresh ? sb : null;
+      const key = (x) => (x ? `${x.deviceId}|${x.deviceName}|${x.lastScene}` : '');
+      const changed = key(sb) !== key(this.standby);
+      this.standby = sb;
+      if (changed) this.onStandby(sb);
+    } catch (e) { this.onError(e); }
+  }
 
   async check() {
     try {
@@ -128,13 +171,82 @@ export class LiveWatcher {
   }
 }
 
-/** 録音している端末に停止を指示する */
-export async function requestRemoteStop(live) {
+// ---------------------------------------------------------------------------
+// 待機：この端末を、ほかの端末から録音開始できる状態にする
+// ---------------------------------------------------------------------------
+export class StandbyAgent {
+  constructor({ onStart, onError, info }) {
+    this.onStart = onStart;
+    this.onError = onError || (() => {});
+    this.info = info || (() => ({}));
+    this.active = false;
+    this.startETag = null;
+  }
+
+  record(status) {
+    const st = getSettings();
+    return { deviceId: st.deviceId, deviceName: st.deviceName, status, heartbeat: Date.now(), ...this.info() };
+  }
+
+  async start() {
+    this.active = true;
+    // 待機を始める前からある指示は無視する（その時点の版を覚えておき、変わったときだけ読む）
+    try { const item = await od.getItem(startPath()); this.startETag = item ? item.eTag : null; } catch (e) { this.onError(e); }
+    await od.uploadJson(standbyPath(), this.record('standby'));
+    this.hb = setInterval(() => { od.uploadJson(standbyPath(), this.record('standby')).catch((e) => this.onError(e)); }, 20000);
+    this.poll = setInterval(() => this.check(), 4000);
+  }
+
+  async check() {
+    if (!this.active || this.busy) return;
+    this.busy = true;
+    try {
+      const res = await readJsonIfChanged(startPath(), this.startETag);
+      if (res.eTag) this.startETag = res.eTag;
+      const c = res.data;
+      if (c && c.command === 'start' && c.target === getSettings().deviceId && this.active) {
+        await this.stop('starting');
+        this.onStart(c);
+      }
+    } catch (e) { this.onError(e); } finally { this.busy = false; }
+  }
+
+  async stop(status = 'off') {
+    if (!this.active) return;
+    this.active = false;
+    clearInterval(this.hb);
+    clearInterval(this.poll);
+    try { await od.uploadJson(standbyPath(), this.record(status)); } catch (e) { this.onError(e); }
+  }
+}
+
+/** 待機中の端末に、録音の開始を指示する */
+export async function requestRemoteStart(standby, params) {
   const st = getSettings();
-  await od.uploadJson(metaPath(live.folderPath, 'control.json'), {
-    command: 'stop', sessionId: live.sessionId, at: Date.now(), by: st.deviceName, byDevice: st.deviceId,
+  await od.uploadJson(startPath(), {
+    command: 'start', target: standby.deviceId, params, at: Date.now(), by: st.deviceName, byDevice: st.deviceId,
+    nonce: Math.random().toString(36).slice(2),
   });
 }
+
+/** 録音状況のファイルに、1回だけ状態を書く（保存完了の通知など） */
+export async function writeLiveOnce(session, status) {
+  const st = getSettings();
+  await od.uploadJson(livePath(), {
+    sessionId: session.id, folderPath: session.folderPath, folderName: session.folderName, title: session.title,
+    projectId: session.projectId, startedAt: session.startedAt, status,
+    deviceId: session.deviceId || st.deviceId, deviceName: session.deviceName || st.deviceName, elapsed: session.durationSec || 0, heartbeat: Date.now(),
+  });
+}
+
+/** 録音している端末に指示する：'stop'＝録音の終了、'process'＝①（保存・書き起こし）の開始 */
+export async function requestRemote(live, command) {
+  const st = getSettings();
+  await od.uploadJson(metaPath(live.folderPath, 'control.json'), {
+    command, sessionId: live.sessionId, at: Date.now(), by: st.deviceName, byDevice: st.deviceId,
+  });
+}
+export const requestRemoteStop = (live) => requestRemote(live, 'stop');
 
 /** 会議フォルダ内の、全端末のメモを読む */
 export async function readAllMemos(folderPath) {

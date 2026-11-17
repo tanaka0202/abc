@@ -1,11 +1,12 @@
 // OneDrive（Microsoft Graph）。個人用OneDriveの指定フォルダに読み書きする。
 import { msGetToken } from './auth.js';
 import { getSettings } from './settings.js';
-import { AppError, sleep } from './util.js';
+import { AppError, sleep, isMobile } from './util.js';
 
 const GRAPH = 'https://graph.microsoft.com/v1.0/me/drive';
 const SMALL_LIMIT = 4 * 1024 * 1024;
-const CHUNK = 320 * 1024 * 16; // 5MiB（320KiBの倍数である必要がある）
+// 分割アップロードの1回分（320KiBの倍数である必要がある）。PCは10MiBにして往復の回数を減らす。スマホは、回線が切れたときのやり直しが小さく済むよう5MiB
+const chunkSize = () => 320 * 1024 * (isMobile() ? 16 : 32);
 
 const encPath = (p) => String(p).split('/').filter(Boolean).map(encodeURIComponent).join('/');
 export const joinPath = (...parts) => parts.flatMap((p) => String(p || '').split('/')).filter(Boolean).join('/');
@@ -58,9 +59,16 @@ export async function getMe() {
   return r.json();
 }
 
+// あることを確かめたフォルダは10分間覚えておき、同じ問い合わせを繰り返さない（保存のたびに親フォルダを1段ずつ確かめ直さない）
+const knownFolders = new Map(); // path → { item, at }
+const FOLDER_TTL = 10 * 60 * 1000;
+
 /** フォルダがなければ親から順に作る */
 export async function ensureFolder(path) {
   const parts = String(path).split('/').filter(Boolean);
+  const full = parts.join('/');
+  const hit = knownFolders.get(full);
+  if (hit && Date.now() - hit.at < FOLDER_TTL) return hit.item;
   let cur = '';
   for (const name of parts) {
     const next = cur ? `${cur}/${name}` : name;
@@ -80,7 +88,9 @@ export async function ensureFolder(path) {
     }
     cur = next;
   }
-  return getItem(cur);
+  const item = await getItem(cur);
+  if (item) knownFolders.set(full, { item, at: Date.now() });
+  return item;
 }
 
 /** 同名フォルダがあれば _2, _3 … を付けて新しいフォルダを作る */
@@ -88,17 +98,15 @@ export async function createUniqueFolder(parent, name) {
   await ensureFolder(parent);
   for (let i = 1; i < 50; i++) {
     const n = i === 1 ? name : `${name}_${i}`;
-    const exists = await getItem(joinPath(parent, n));
-    if (!exists) {
-      try {
-        await graph('POST', `/root:/${encPath(parent)}:/children`, {
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: n, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }),
-        });
-        return { name: n, path: joinPath(parent, n) };
-      } catch (e) {
-        if (e.status !== 409) throw e;
-      }
+    // 先に有無を問い合わせず、そのまま作る（同名があれば「重複」で返るので、次の名前を試す）。作成の応答からURLも受け取る
+    try {
+      const item = await graph('POST', `/root:/${encPath(parent)}:/children`, {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: n, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }),
+      });
+      return { name: n, path: joinPath(parent, n), webUrl: (item && item.webUrl) || '' };
+    } catch (e) {
+      if (e.status !== 409) throw e;
     }
   }
   throw new AppError('保存先フォルダを作れませんでした。');
@@ -122,6 +130,7 @@ async function uploadLarge(path, blob, onProgress) {
     body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'replace' } }),
   });
   const url = sess.uploadUrl;
+  const CHUNK = chunkSize();
   let offset = 0;
   let result = null;
   while (offset < blob.size) {
@@ -186,6 +195,13 @@ export async function readJson(path) {
 export async function readText(path) {
   const res = await download(path, 'text');
   return res ? res.body : null;
+}
+
+/** ファイル・フォルダを削除する（OneDriveのごみ箱に移る）。なければ何もしない */
+export async function remove(path) {
+  const full = String(path).split('/').filter(Boolean).join('/');
+  for (const k of [...knownFolders.keys()]) if (k === full || k.startsWith(`${full}/`)) knownFolders.delete(k);
+  await graph('DELETE', `/root:/${encPath(path)}`, { allow404: true });
 }
 
 export async function listChildren(path) {

@@ -1,5 +1,5 @@
 // メモ（REQ-4 / B-5 / B-6）。端末内に保存し、会議フォルダがあればOneDriveにも保存する。
-import { kvGet, kvSet } from './db.js';
+import { kvGet, kvSet, kvDel } from './db.js';
 import { getSettings } from './settings.js';
 import { uuid, debounce } from './util.js';
 import { writeMyMemos } from './sync.js';
@@ -16,6 +16,9 @@ function serial(sessionId, fn) {
   locks.set(sessionId, next.catch(() => {}));
   return next;
 }
+
+/** この端末に残っている、その会議のメモを消す（録音の破棄用） */
+export function clearMyMemos(sessionId) { return serial(sessionId, () => kvDel(key(sessionId))); }
 
 export async function getMyMemos(sessionId) { return (await kvGet(key(sessionId), [])) || []; }
 

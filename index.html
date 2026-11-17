@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <!-- 通信先を Google（Gemini・カレンダー）と Microsoft（OneDrive）に限定する -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: https://*.1drv.com https://*.onedrive.com https://*.sharepoint.com https://*.livefilestore.com https://*.microsoftpersonalcontent.com https://*.live.com; connect-src 'self' https://generativelanguage.googleapis.com https://www.googleapis.com https://graph.microsoft.com https://login.microsoftonline.com https://*.1drv.com https://*.onedrive.com https://*.sharepoint.com https://*.livefilestore.com https://*.microsoftpersonalcontent.com https://*.live.com; worker-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <!-- 通信先を Google（Gemini・カレンダー）と Microsoft（OneDrive）に限定する。
+       frame-src：サインインの自動更新で使う見えない枠は、このアプリ自身と、Microsoft・Googleのサインイン画面だけを開ける -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: https://*.1drv.com https://*.onedrive.com https://*.sharepoint.com https://*.livefilestore.com https://*.microsoftpersonalcontent.com https://*.live.com; connect-src 'self' https://generativelanguage.googleapis.com https://www.googleapis.com https://graph.microsoft.com https://login.microsoftonline.com https://*.1drv.com https://*.onedrive.com https://*.sharepoint.com https://*.livefilestore.com https://*.microsoftpersonalcontent.com https://*.live.com; worker-src 'self'; frame-src 'self' https://login.microsoftonline.com https://login.live.com https://accounts.google.com; object-src 'none'; base-uri 'self'; form-action 'none'">
   <meta name="referrer" content="strict-origin-when-cross-origin">
   <meta name="theme-color" content="#0f172a">
   <title>AI会議録音＆OneDrive自動議事録</title>
@@ -18,6 +19,7 @@
     <div class="brand">
       <span class="logo" aria-hidden="true">●</span>
       <span class="brand-name">会議録音・議事録</span>
+      <span id="app-ver" class="ver"></span>
     </div>
     <div id="status" class="status" aria-live="polite"></div>
   </header>

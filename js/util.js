@@ -120,6 +120,22 @@ export function isIOS() {
 }
 export function isMobile() { return isAndroid() || isIOS(); }
 
+/** アプリの版。css/app.css の --app-version と同じ値にする（食い違いは、更新が途中であることを示す） */
+export const APP_VERSION = '2.7.0';
+
+/**
+ * スマホ・タブレットかどうか。Androidのタブレットや「PC版サイト」の設定では、
+ * ブラウザがPCと名乗る（Androidという語を含まない）ため、名乗りだけでなく、指で操作する端末かどうかも見る。
+ */
+export function isTouchDevice() {
+  if (isMobile()) return true;
+  try {
+    const uad = navigator.userAgentData;
+    if (uad && (uad.mobile || /Android/i.test(uad.platform || ''))) return true;
+    return navigator.maxTouchPoints > 0 && window.matchMedia('(pointer: coarse)').matches;
+  } catch { return false; }
+}
+
 export function defaultDeviceName() {
   if (isAndroid()) return 'Android';
   if (isIOS()) return 'iPad/iPhone';

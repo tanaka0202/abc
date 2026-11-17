@@ -273,8 +273,10 @@ export async function refineTranscript(segments, { terms, participants, speakerN
   const BATCH = 500;
   const mapping = {};
   const corrections = [];
-  for (let i = 0; i < segments.length; i += BATCH) {
-    const part = segments.slice(i, i + BATCH);
+  const batches = [];
+  for (let i = 0; i < segments.length; i += BATCH) batches.push(segments.slice(i, i + BATCH));
+  // 長い会議（発言が500件を超える）は、まとまりごとに同時に補正する（結果は元の順に取り込む）
+  const outs = await Promise.all(batches.map((part) => {
     const lines = part.map((s) => `${s.id}|${s.label}|${fmtTime(s.start)}|${s.text.replace(/\n/g, ' ')}`).join('\n');
     const text = [
       participants && participants.length ? `■参加者：${participants.join('、')}` : '■参加者：不明',
@@ -283,7 +285,9 @@ export async function refineTranscript(segments, { terms, participants, speakerN
       '■書き起こし（id|話者ラベル|時刻|発言）：',
       lines,
     ].filter(Boolean).join('\n\n');
-    const obj = await generateJson(g.textModel, { system, parts: [{ text }], schema, thinkingLevel: 'low' }, { kind: 'refine', sessionId, signal });
+    return generateJson(g.textModel, { system, parts: [{ text }], schema, thinkingLevel: 'low' }, { kind: 'refine', sessionId, signal });
+  }));
+  for (const obj of outs) {
     for (const s of obj.speakers || []) if (s && s.label && !mapping[s.label]) mapping[s.label] = { speaker: s.speaker, name: (s.name || '').trim() };
     corrections.push(...(obj.corrections || []));
   }

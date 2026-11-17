@@ -1,11 +1,14 @@
 // Googleカレンダー（REQ-9 / P-1）
-import { googleGetToken } from './auth.js';
+import { googleGetToken, googleEnsure } from './auth.js';
 import { getSettings } from './settings.js';
 import { AppError } from './util.js';
 
 const API = 'https://www.googleapis.com/calendar/v3';
 
 async function call(method, path, body) {
+  // 約1時間で切れるので、切れていたら画面を出さずにつなぎ直してから使う
+  const g = getSettings().google;
+  await googleEnsure(g.clientId, g.account).catch(() => false);
   const t = await googleGetToken();
   const r = await fetch(`${API}${path}`, {
     method,

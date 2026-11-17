@@ -7,6 +7,8 @@ const FLUSH_SAMPLES = SAMPLE_RATE * 5;      // 5秒ごとに保存
 const GAP_THRESHOLD = SAMPLE_RATE * 2;      // 2秒以上の欠落を途切れとみなす
 const GAP_SLACK = SAMPLE_RATE * 0.3;        // 処理の遅れの分は補わない
 const STALL_MS = 8000;                      // 8秒以上音声が届かなければ、止まったとみなす
+const ZERO_ALERT = SAMPLE_RATE * 10;        // 完全な無音（値がすべて0）が10秒続いたら知らせる
+const MUTE_ALERT_MS = 3000;                 // マイクが消音された状態が3秒続いたら知らせる
 
 export class Recorder {
   constructor({ session, settings, onLevel, onTick, onWarning, onStarted }) {
@@ -34,6 +36,11 @@ export class Recorder {
     this.lastAudioAt = 0;
     this.stallWarned = false;
     this.source = 'mic';
+    this.zeroRun = 0;          // 完全な無音が続いているサンプル数（途切れを補った分は数えない）
+    this.zeroWarned = false;
+    this.zeroIgnore = false;   // 利用者が「静かなだけ」と答えた場合、音が戻るまで知らせない
+    this.zeroTotal = 0;        // 完全な無音だった合計サンプル数（録音後の確認用）
+    this.muteTimer = null;
     this.onVisibility = this.onVisibility.bind(this);
   }
 
@@ -124,9 +131,19 @@ export class Recorder {
     const src = this.ctx.createMediaStreamSource(s);
     src.connect(this.entry);
     s.sources = (s.sources || []).concat(src);
-    s.getAudioTracks().forEach((t) => t.addEventListener('ended', () => {
-      if (this.running && this.streams.includes(s)) this.onWarning('ended', '音声の入力が止まりました（マイクがほかのアプリに使われた可能性があります）。');
-    }));
+    s.getAudioTracks().forEach((t) => {
+      t.addEventListener('ended', () => {
+        if (this.running && this.streams.includes(s)) this.onWarning('ended', '音声の入力が止まりました（マイクがほかのアプリに使われた可能性があります）。');
+      });
+      // 端末がマイクを消音した（通話やほかのアプリがマイクを使った、など）
+      t.addEventListener('mute', () => {
+        clearTimeout(this.muteTimer);
+        this.muteTimer = setTimeout(() => {
+          if (this.running && this.streams.includes(s) && t.muted) this.onWarning('muted', 'マイクの音が届いていません（通話やほかのアプリがマイクを使っている可能性があります）。');
+        }, MUTE_ALERT_MS);
+      });
+      t.addEventListener('unmute', () => clearTimeout(this.muteTimer));
+    });
   }
 
   /**
@@ -151,8 +168,15 @@ export class Recorder {
     if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
     this.lastAudioAt = Date.now();
     this.stallWarned = false;
+    this.zeroRun = 0; this.zeroWarned = false; this.zeroIgnore = false;
     if (this.source === 'tab') this.onWarning('noTabAudio', 'タブの音声はつなぎ直せないため、ここからはマイクの音だけを録音します。');
   }
+
+  /** 完全な無音が続いている長さ（秒） */
+  get zeroSec() { return this.zeroRun / SAMPLE_RATE; }
+
+  /** 「静かなだけ」と確認された：音が戻るまで、無音の警告を出さない */
+  ignoreSilence() { this.zeroIgnore = true; }
 
   /** 端末内に保存し終わった長さ（秒） */
   get savedSec() { return this.savedSamples / SAMPLE_RATE; }
@@ -172,18 +196,29 @@ export class Recorder {
       const lag = expected - (this.totalSamples + n);
       if (lag > GAP_THRESHOLD) {
         const pad = Math.floor(lag - GAP_SLACK);
-        this.pushSamples(new Int16Array(pad));
+        this.pushSamples(new Int16Array(pad), true);
         this.gaps.push({ at: Math.round(this.totalSamples / SAMPLE_RATE), sec: Math.round(pad / SAMPLE_RATE) });
         this.onWarning('gap', `録音が約${Math.round(pad / SAMPLE_RATE)}秒途切れました（無音で補いました）。`);
       }
     }
     this.pushSamples(floatToInt16(float32));
+    // 完全な無音（値がすべて0）が続く：マイクが消音されている・別の入力に切り替わっている、などの可能性
+    if (this.zeroRun >= ZERO_ALERT && !this.zeroWarned && !this.zeroIgnore) {
+      this.zeroWarned = true;
+      this.onWarning('silent', `${Math.round(this.zeroSec)}秒間、まったく音が入っていません（マイクが消音されているか、別のマイクに切り替わっている可能性があります）。`);
+    }
   }
 
-  pushSamples(int16) {
+  pushSamples(int16, isPad = false) {
     this.pending.push(int16);
     this.pendingSamples += int16.length;
     this.totalSamples += int16.length;
+    if (!isPad) {
+      // 末尾から続く0の数を数える（全体が0なら、これまでの分に足す）
+      let tail = 0;
+      for (let i = int16.length - 1; i >= 0 && int16[i] === 0; i--) tail++;
+      if (tail === int16.length) { this.zeroRun += tail; this.zeroTotal += tail; } else { this.zeroRun = tail; this.zeroWarned = false; this.zeroIgnore = false; }
+    }
     // 1秒ごとの音量
     for (let i = 0; i < int16.length; i++) {
       const x = int16[i] / 32768;
@@ -274,6 +309,7 @@ export class Recorder {
     await new Promise((r) => setTimeout(r, 400)); // 最後のデータを受け取る
     this.running = false;
     clearInterval(this.timer);
+    clearTimeout(this.muteTimer);
     document.removeEventListener('visibilitychange', this.onVisibility);
     this.flush();
     try { this.node.disconnect(); } catch { /* 無視 */ }
@@ -293,6 +329,7 @@ export class Recorder {
       gaps: this.gaps.slice(),
       chunkCount: this.seq,
       writeErrors: this.writeErrors,
+      zeroSec: Math.round(this.zeroTotal / SAMPLE_RATE),
     };
   }
 }

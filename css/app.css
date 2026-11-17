@@ -1,5 +1,6 @@
 /* AI会議録音＆OneDrive自動議事録 — スマホ（Android）を基本に、PCでは2列表示 */
 :root {
+  --app-version: "2.7.0"; /* js/util.js の APP_VERSION と同じ値にする */
   --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #66707d; --line: #dde1e6;
   --primary: #1d4ed8; --primary-ink: #ffffff; --danger: #c2262e; --ok: #15803d; --warn: #b45309;
   --rec: #dc2626; --chip: #eef1f5; --focus: #2563eb;
@@ -195,3 +196,26 @@ body.bo-on { overflow: hidden; }
 .bo-alert-primary { min-height: 56px; border-radius: 12px; border: none; background: #fff; color: #3d0f0f; font: inherit; font-size: 16px; font-weight: 700; }
 .bo-alert-secondary { min-height: 52px; border-radius: 12px; border: 1px solid #b97a7a; background: transparent; color: #fff; font: inherit; font-size: 15px; }
 .bo-alert button:disabled { opacity: 0.6; }
+.bo-quiet { position: fixed; left: 16px; right: 16px; bottom: calc(28px + env(safe-area-inset-bottom)); z-index: 1100; max-width: 448px; margin: 0 auto; box-sizing: border-box; display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border-radius: 16px; background: #121212; border: 1px solid #262626; color: #c4c4c4; -webkit-user-select: none; user-select: none; }
+.bo-quiet-head { display: flex; align-items: center; gap: 10px; }
+.bo-quiet-dot { width: 8px; height: 8px; border-radius: 4px; flex-shrink: 0; background: #c9a06a; }
+.bo-quiet-label { flex: 1; font-size: 14px; color: #c4c4c4; }
+.bo-quiet-time { font-size: 13px; color: #8e8e8e; font-variant-numeric: tabular-nums; }
+.bo-quiet-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.bo-quiet-primary { min-height: 44px; border-radius: 10px; border: 1px solid #3a3a3a; background: #1c1c1c; color: #d6d6d6; font: inherit; font-size: 14px; }
+.bo-quiet-secondary { min-height: 44px; border-radius: 10px; border: 1px solid #2a2a2a; background: transparent; color: #9a9a9a; font: inherit; font-size: 14px; }
+.bo-quiet button:focus-visible { outline: 2px solid #8a8a8a; outline-offset: 2px; }
+.bo-quiet button:disabled { opacity: 0.6; }
+
+.bo-save { min-height: 56px; border-radius: 12px; border: 1px solid #4a4a4a; background: #2a2a2a; color: #e2e2e2; font: inherit; font-size: 15px; font-weight: 700; }
+.bo-save:focus-visible { outline: 2px solid #8a8a8a; outline-offset: 2px; }
+.ver { font-weight: 400; font-size: 0.72rem; color: var(--muted); }
+.pending-card { border: 2px solid var(--primary); }
+.pending-card .row { align-items: stretch; }
+
+.bo-next { min-height: 48px; border-radius: 12px; border: 1px solid #333; background: transparent; color: #b0b0b0; font: inherit; font-size: 14px; }
+.bo-next:focus-visible { outline: 2px solid #8a8a8a; outline-offset: 2px; }
+.bo-dot.bo-live { animation: none; opacity: 1; transition: background 0.6s; }
+.unsaved-item { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid var(--line); }
+.unsaved-item:first-of-type { border-top: none; }
+.queue-line { font-size: 0.85rem; color: var(--muted); }
