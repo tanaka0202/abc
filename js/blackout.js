@@ -1,12 +1,45 @@
-// 録音中・処理中に画面を黒くする（案A）。2回タップで操作を出し、5秒操作しなければ黒に戻る。
+// 録音中・処理中に画面を黒くする（案A）。2回タップ・長押し・戻るボタンで操作を出し、5秒操作しなければ黒に戻る。
 // 録音が止まったときだけ、画面を明るくして振動で知らせる。音が入っていないときは、暗いまま小さな帯で知らせる。
 import { el, clear, fmtTime } from './util.js';
 import { holdButton } from './ui.js';
 
-const DOUBLE_TAP_MS = 400;
-const DOUBLE_TAP_PX = 48;
+// 2回タップの判定。間隔は、1回目と2回目の「指を離した時刻」の差（ゆっくりめの2回タップでも反応するよう、0.65秒まで）。
+// 時刻は、画面の処理が混んでいても正しく測れるよう、タップが起きた時刻（イベントの時刻）を使う
+const DOUBLE_TAP_MS = 650;
+const DOUBLE_TAP_PX = 80;
+const LONG_PRESS_MS = 800;   // 長押しで操作を出す
+const LONG_PRESS_MOVE_PX = 30;
 const PANEL_IDLE_MS = 5000;
 const HINT_MS = 3000;
+const HINT_TEXT = '2回タップ、または長押しで操作を表示します';
+
+// ---------------------------------------------------------------------------
+// 戻るボタン（Android）：黒い画面の間は、戻るボタンで操作を出す（アプリから出てしまわないように、履歴を1つ足しておく）
+// ---------------------------------------------------------------------------
+let activeBo = null;
+let ignorePops = 0;   // 黒い画面を閉じるときに、自分で足した履歴を戻した分（戻るボタンとして扱わない）
+let popInstalled = false;
+const BO_STATE = 'mtgrecBo';
+function pushEntry() {
+  try { if (!(history.state && history.state[BO_STATE])) history.pushState({ [BO_STATE]: true }, ''); } catch { /* 無視 */ }
+}
+function popEntry() {
+  try {
+    if (history.state && history.state[BO_STATE]) {
+      ignorePops++;
+      setTimeout(() => { ignorePops = 0; }, 2000);
+      history.back();
+    }
+  } catch { /* 無視 */ }
+}
+function installPop() {
+  if (popInstalled) return;
+  popInstalled = true;
+  window.addEventListener('popstate', () => {
+    if (ignorePops > 0) { ignorePops--; if (activeBo) pushEntry(); return; }
+    if (activeBo) { pushEntry(); activeBo.onBack(); }
+  });
+}
 
 const ICONS = {
   star: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>',
@@ -15,6 +48,22 @@ const ICONS = {
   back: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 12h16"/><path d="M10 6l-6 6 6 6"/></svg>',
   warn: '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l10 18H2z"/><path d="M12 10v5"/><path d="M12 18v.5"/></svg>',
 };
+
+/**
+ * 押し間違い（ゴーストクリック）の防止。
+ * 2回タップの2回目の指で操作パネルが出ると、その同じ指の「クリック」が、出たばかりのボタン（暗くする・通常の画面・
+ * メモ・印を付ける・保存して書き起こす など）を押してしまう。パネルが出た後に、パネルの中で新しく指を置いた
+ * （pointerdown）場合だけ、クリックを受け付ける。キーボードでの操作（detail=0）はそのまま受け付ける。
+ */
+function freshClicksOnly(box) {
+  box.dataset.armed = '';
+  box.addEventListener('pointerdown', () => { box.dataset.armed = '1'; }, true);
+  box.addEventListener('click', (e) => {
+    if (box.dataset.armed || e.detail === 0) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, true);
+}
 
 function iconButton(icon, label, onClick, extra = {}) {
   const b = el('button', { class: 'bo-btn', type: 'button', onclick: onClick, ...extra });
@@ -57,14 +106,24 @@ export class Blackout {
   /** 黒い画面にする。利用者の操作の直後なら、全画面にして上下の帯も消す */
   show({ hint = true } = {}) {
     if (this.root) return;
-    this.root = el('div', { class: 'blackout', tabindex: '0', 'aria-label': '暗い画面。2回タップ（またはEnter）で操作を表示します' });
-    // 黒くする部分だけは、デザインのファイル（CSS）に頼らず直接指定する（CSSが古い版のままでも必ず黒くなるように）
-    Object.assign(this.root.style, { position: 'fixed', top: '0', left: '0', right: '0', bottom: '0', zIndex: '1000', background: '#000' });
+    this.root = el('div', { class: 'blackout', tabindex: '0', 'aria-label': '暗い画面。2回タップ、長押し、戻るボタン、またはEnterで操作を表示します' });
+    // 黒くする部分と、指の操作の扱いは、デザインのファイル（CSS）に頼らず直接指定する（CSSが古い版のままでも必ず効くように）。
+    // touchAction 'none'：ブラウザの拡大などの動作に指の操作を取られず、2回タップ・長押しを必ずアプリで受け取る
+    Object.assign(this.root.style, { position: 'fixed', top: '0', left: '0', right: '0', bottom: '0', zIndex: '1000', background: '#000', touchAction: 'none', userSelect: 'none', webkitUserSelect: 'none' });
     this.dot = el('div', { class: 'bo-dot', 'aria-hidden': 'true' });
-    this.hint = hint ? el('p', { class: 'bo-hint' }, typeof hint === 'string' ? hint : '2回タップすると操作が表示されます') : null;
+    this.hint = hint ? el('p', { class: 'bo-hint' }, typeof hint === 'string' ? hint : HINT_TEXT) : null;
     this.panel = el('div', { class: 'bo-panel', hidden: true });
+    freshClicksOnly(this.panel);
+    this.panel.addEventListener('pointerdown', () => this.bumpIdle());
     this.root.append(this.dot, ...(this.hint ? [this.hint] : []), this.panel);
+    this.lastTap = null;
+    this.press = null;
+    this.wasFull = false;
+    this.root.addEventListener('pointerdown', (e) => this.onDown(e));
+    this.root.addEventListener('pointermove', (e) => this.onMove(e));
+    this.root.addEventListener('pointercancel', () => this.cancelPress());
     this.root.addEventListener('pointerup', (e) => this.onTap(e));
+    this.root.addEventListener('dblclick', (e) => this.onDblClick(e));
     this.root.addEventListener('keydown', (e) => {
       if (e.target !== this.root) return;
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.showPanel(); }
@@ -74,11 +133,42 @@ export class Blackout {
     document.body.appendChild(this.root);
     document.body.classList.add('bo-on');
     this.root.focus({ preventScroll: true });
-    if (this.hint) setTimeout(() => { if (this.hint) this.hint.classList.add('bo-fade'); }, HINT_MS);
+    if (this.hint) this.fadeHint();
+    // 戻るボタン・全画面の終了・画面に戻ったときの知らせを受け取る
+    activeBo = this;
+    installPop();
+    pushEntry();
+    this.onFull = () => {
+      if (!this.root) return;
+      if (document.fullscreenElement) { this.wasFull = true; return; }
+      // 全画面の間に戻るボタンを押すと、ブラウザが全画面を終える（戻るの知らせは来ない）。そのときも操作を出す
+      if (this.wasFull) { this.wasFull = false; if (this.panel.hidden) this.showPanel(); }
+    };
+    this.onVis = () => { if (this.root && document.visibilityState === 'visible' && this.panel.hidden) this.showHint(); };
+    document.addEventListener('fullscreenchange', this.onFull);
+    document.addEventListener('visibilitychange', this.onVis);
+    this.enterFull();
+  }
+
+  /** 全画面にする（利用者の操作の直後だけ成功する。できない環境では黒い画面だけにする） */
+  enterFull() {
     try {
       const fs = document.documentElement.requestFullscreen;
       if (fs && !document.fullscreenElement) document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
-    } catch { /* 全画面にできない環境では黒い画面だけにする */ }
+    } catch { /* 無視 */ }
+  }
+
+  /** 操作の案内を、3秒だけ出す（画面に戻ったときにも出す） */
+  showHint() {
+    if (!this.root) return;
+    if (!this.hint) { this.hint = el('p', { class: 'bo-hint' }, HINT_TEXT); this.root.insertBefore(this.hint, this.panel); }
+    this.hint.classList.remove('bo-fade');
+    this.fadeHint();
+  }
+
+  fadeHint() {
+    clearTimeout(this.hintTimer);
+    this.hintTimer = setTimeout(() => { if (this.hint) this.hint.classList.add('bo-fade'); }, HINT_MS);
   }
 
   /**
@@ -97,7 +187,13 @@ export class Blackout {
   /** 黒い画面をやめて、通常の画面に戻す */
   hide() {
     this.hidePanel();
+    this.cancelPress();
+    if (this.onFull) { document.removeEventListener('fullscreenchange', this.onFull); this.onFull = null; }
+    if (this.onVis) { document.removeEventListener('visibilitychange', this.onVis); this.onVis = null; }
     if (this.root) { this.root.remove(); this.root = null; }
+    if (activeBo === this) { activeBo = null; popEntry(); }
+    clearTimeout(this.hintTimer);
+    this.hint = null;
     document.body.classList.remove('bo-on');
     try { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch { /* 無視 */ }
   }
@@ -107,20 +203,67 @@ export class Blackout {
     if (this.onExit) this.onExit();
   }
 
-  onTap(e) {
-    if (!this.root || (this.panel && !this.panel.hidden && this.panel.contains(e.target))) return;
-    const now = performance.now();
-    const p = this.lastTap;
-    if (p && now - p.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - p.x, e.clientY - p.y) < DOUBLE_TAP_PX) {
+  /** 操作パネルの上の操作か（パネルのボタンは、それぞれのボタンで処理する） */
+  inPanel(e) { return !!(this.panel && !this.panel.hidden && this.panel.contains(e.target)); }
+
+  /** 指を置いた：長押しの計測を始める */
+  onDown(e) {
+    if (!this.root || this.inPanel(e) || (e.button !== undefined && e.button > 0)) return;
+    this.cancelPress();
+    if (e.isPrimary === false) return;
+    const press = { id: e.pointerId, x: e.clientX, y: e.clientY, fired: false };
+    press.timer = setTimeout(() => {
+      press.fired = true;
       this.lastTap = null;
+      try { if (navigator.vibrate) navigator.vibrate(30); } catch { /* 無視 */ }
+      if (this.panel && this.panel.hidden) this.showPanel(); else this.bumpIdle();
+    }, LONG_PRESS_MS);
+    this.press = press;
+  }
+
+  onMove(e) {
+    const p = this.press;
+    if (p && p.id === e.pointerId && !p.fired && Math.hypot(e.clientX - p.x, e.clientY - p.y) > LONG_PRESS_MOVE_PX) this.cancelPress();
+  }
+
+  cancelPress() {
+    if (this.press) { clearTimeout(this.press.timer); this.press = null; }
+  }
+
+  /** 指を離した：2回タップかどうかを判定する */
+  onTap(e) {
+    const press = this.press;
+    if (press && press.id === e.pointerId) { clearTimeout(press.timer); this.press = null; if (press.fired) return; } // 長押しだった
+    if (!this.root || this.inPanel(e)) return;
+    const now = e.timeStamp || performance.now(); // タップが起きた時刻（画面の処理が混んでいても正確）
+    const p = this.lastTap;
+    if (p && now - p.t > 0 && now - p.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - p.x, e.clientY - p.y) < DOUBLE_TAP_PX) {
+      this.lastTap = null;
+      this.toggledAt = performance.now();
       if (this.panel.hidden) this.showPanel(); else this.hidePanel();
       return;
     }
     this.lastTap = { t: now, x: e.clientX, y: e.clientY };
   }
 
+  /** 予備：ブラウザ自身が「2回タップ」と判定した場合（上の判定で取りこぼしたとき）にも、操作を出す */
+  onDblClick(e) {
+    if (!this.root || this.inPanel(e)) return;
+    if (performance.now() - (this.toggledAt || 0) < 900) return; // 上の判定ですでに切り替えた
+    this.lastTap = null;
+    if (this.panel.hidden) this.showPanel();
+  }
+
+  /** 戻るボタン：操作が隠れていれば出し、出ていれば隠す */
+  onBack() {
+    if (!this.root) return;
+    if (this.alertBox && !this.quietBox) return; // 明るい警告が出ている間は、警告のボタンで操作する
+    if (this.panel.hidden) this.showPanel(); else this.hidePanel();
+  }
+
   showPanel() {
     if (!this.root) return;
+    if (this.panel.hidden) this.panel.dataset.armed = ''; // 出す前から触れていた指のクリックは受け付けない
     this.panel.hidden = false;
     this.root.classList.add('bo-panel-on');
     if (this.hint) { this.hint.remove(); this.hint = null; }
@@ -137,6 +280,12 @@ export class Blackout {
     if (this.panel) this.panel.hidden = true;
     if (this.root) { this.root.classList.remove('bo-panel-on'); this.root.focus({ preventScroll: true }); }
     this.placeNotice();
+  }
+
+  /** 「暗くする」：操作を隠し、全画面に戻す（戻るボタンで全画面が終わっていた場合） */
+  darken() {
+    this.hidePanel();
+    this.enterFull();
   }
 
   /** 操作がなければ5秒で黒に戻す（長押しの途中と、保存するかの確認待ちの間は戻さない） */
@@ -160,33 +309,35 @@ export class Blackout {
       rows.push(el('div', { class: 'bo-grid' },
         iconButton('star', '印を付ける', async () => { this.bumpIdle(); await this.onPin(); this.flashMsg('印を付けました'); }),
         iconButton('memo', 'メモ', () => { this.hide(); this.onMemo(); }),
-        iconButton('moon', '暗くする', () => this.hidePanel())));
+        iconButton('back', '通常の画面', () => this.exit()),
+        iconButton('moon', '暗くする', () => this.darken())));
+      rows[rows.length - 1].classList.add('four');
+      rows[rows.length - 1].style.gridTemplateColumns = 'repeat(4, minmax(0, 1fr))';
       rows.push(holdButton('長押しで終了', () => { this.onStop(); }, { className: 'bo-stop', enabled: this.holdToStop, hint: '長押しで終了' }));
       rows.push(el('p', { class: 'bo-note' }, '5秒間操作しないと、元の暗い画面に戻ります'));
     } else if (s.mode === 'standby') {
       rows.push(el('button', { class: 'bo-save', type: 'button', onclick: () => this.onStandbyStart() }, 'この端末で録音を始める'));
       rows.push(el('div', { class: 'bo-grid two' },
         iconButton('back', '待機をやめる', () => this.onStandbyStop()),
-        iconButton('moon', '暗くする', () => this.hidePanel())));
+        iconButton('moon', '暗くする', () => this.darken())));
       rows.push(el('p', { class: 'bo-note' }, 'ほかの端末の「録音開始」で、この端末の録音が始まります。画面は消さないでください'));
     } else if (s.mode === 'done') {
       rows.push(el('button', { class: 'bo-save', type: 'button', onclick: () => this.onSave() }, s.saveLabel || '保存して書き起こす'));
       rows.push(el('button', { class: 'bo-next', type: 'button', onclick: () => this.onSaveNext() }, '保存して、次の会議の録音を始める'));
       rows.push(el('div', { class: 'bo-grid two' },
         iconButton('back', '通常の画面に戻る', () => this.exit()),
-        iconButton('moon', '暗くする', () => this.hidePanel())));
+        iconButton('moon', '暗くする', () => this.darken())));
       rows.push(el('p', { class: 'bo-note' }, 'まだ保存していません。録音はこの端末の中にあります。破棄は通常の画面で行えます'));
     } else {
       rows.push(el('button', { class: 'bo-next', type: 'button', onclick: () => this.onNext() }, '次の会議の録音を始める'));
       rows.push(el('div', { class: 'bo-grid two' },
         iconButton('back', '通常の画面に戻る', () => this.exit()),
-        iconButton('moon', '暗くする', () => this.hidePanel())));
+        iconButton('moon', '暗くする', () => this.darken())));
       rows.push(el('p', { class: 'bo-note' }, '終わると、自動で通常の画面に戻ります'));
     }
     this.flashLine = el('p', { class: 'bo-flash', 'aria-live': 'polite' });
     rows.push(this.flashLine);
     this.panel.append(...rows);
-    this.panel.addEventListener('pointerdown', () => this.bumpIdle());
     this.renderPanelStatus();
   }
 
@@ -240,6 +391,7 @@ export class Blackout {
       el('div', { class: 'bo-alert-body' }, ico, el('h2', { id: 'bo-alert-title' }, title), el('p', {}, message)),
       el('div', { class: 'bo-alert-actions' }, p, s));
     Object.assign(this.alertBox.style, { position: 'fixed', top: '0', left: '0', right: '0', bottom: '0', zIndex: '1100', background: '#3d0f0f', color: '#fff' });
+    freshClicksOnly(this.alertBox);
     document.body.appendChild(this.alertBox);
     p.focus();
   }
@@ -271,6 +423,7 @@ export class Blackout {
       el('div', { class: 'bo-quiet-actions' }, p, s));
     // 位置と色は、デザインのファイル（CSS）が古い版のままでも崩れないよう、直接指定する
     Object.assign(this.alertBox.style, { position: 'fixed', left: '16px', right: '16px', zIndex: '1100', background: '#121212', color: '#c4c4c4' });
+    freshClicksOnly(this.alertBox);
     this.quietBox = this.alertBox;
     this.placeNotice();
     document.body.appendChild(this.alertBox);

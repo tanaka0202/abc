@@ -121,7 +121,7 @@ export function isIOS() {
 export function isMobile() { return isAndroid() || isIOS(); }
 
 /** アプリの版。css/app.css の --app-version と同じ値にする（食い違いは、更新が途中であることを示す） */
-export const APP_VERSION = '2.7.0';
+export const APP_VERSION = '2.7.2';
 
 /**
  * スマホ・タブレットかどうか。Androidのタブレットや「PC版サイト」の設定では、

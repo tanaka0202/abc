@@ -1,6 +1,6 @@
 /* AI会議録音＆OneDrive自動議事録 — スマホ（Android）を基本に、PCでは2列表示 */
 :root {
-  --app-version: "2.7.0"; /* js/util.js の APP_VERSION と同じ値にする */
+  --app-version: "2.7.2"; /* js/util.js の APP_VERSION と同じ値にする */
   --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #66707d; --line: #dde1e6;
   --primary: #1d4ed8; --primary-ink: #ffffff; --danger: #c2262e; --ok: #15803d; --warn: #b45309;
   --rec: #dc2626; --chip: #eef1f5; --focus: #2563eb;
@@ -164,7 +164,7 @@ th { background: var(--chip); }
 
 /* ---- 黒い画面（録音中・処理中） ---- */
 body.bo-on { overflow: hidden; }
-.blackout { position: fixed; inset: 0; z-index: 1000; background: #000; color: #8e8e8e; touch-action: manipulation; -webkit-user-select: none; user-select: none; outline: none; -webkit-tap-highlight-color: transparent; }
+.blackout { position: fixed; inset: 0; z-index: 1000; background: #000; color: #8e8e8e; touch-action: none; -webkit-user-select: none; user-select: none; outline: none; -webkit-tap-highlight-color: transparent; }
 .bo-dot { position: absolute; right: 18px; bottom: calc(18px + env(safe-area-inset-bottom)); width: 6px; height: 6px; border-radius: 3px; background: #2a2a2a; animation: bo-pulse 4s ease-in-out infinite; }
 @keyframes bo-pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .bo-dot { animation: none; } }
@@ -181,6 +181,8 @@ body.bo-on { overflow: hidden; }
 .bo-warnline { flex-basis: 100%; margin: 0; font-size: 12px; color: #d9a35b; }
 .bo-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .bo-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.bo-grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.bo-grid.four .bo-btn { font-size: 11px; padding: 0 2px; }
 .bo-btn { min-height: 56px; border-radius: 12px; border: 1px solid #333; background: transparent; color: #b0b0b0; font: inherit; font-size: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 6px; }
 .bo-btn:focus-visible, .bo-stop:focus-visible { outline: 2px solid #8a8a8a; outline-offset: 2px; }
 .bo-ico { display: flex; }

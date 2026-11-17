@@ -1109,7 +1109,7 @@ async function enterStandby() {
     try { if ('wakeLock' in navigator) S.standbyWake = await navigator.wakeLock.request('screen'); } catch { /* 無視 */ }
     render();
     const dark = getSettings().recording.darkOnStart;
-    if (dark === 'on' || (dark !== 'off' && isTouchDevice())) { blackout().show({ hint: '待機中です。2回タップすると操作が表示されます' }); }
+    if (dark === 'on' || (dark !== 'off' && isTouchDevice())) { blackout().show({ hint: '待機中です。2回タップ、または長押しで操作を表示します' }); }
     else toast('待機を始めました。ほかの端末の「録音開始」で、この端末の録音が始まります。', 'ok', 6000);
   } catch (e) {
     S.standbyAgent = null;
